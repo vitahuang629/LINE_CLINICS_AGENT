@@ -1,0 +1,12 @@
+venv/
+*.env
+data/
+notebook/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.sqlite3
+# System files
+.DS_Store

@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "line-clinics-agent"
+version = "0.1.0"
+description = ""
+authors = ["Vita Huang <bexo@gastom.com.tw>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "3.11.0"
+streamlit = "^1.46.1"
+langgraph = "0.2.70"
+numpy = "1.26.4"
+pandas = "2.2.3"
+uvicorn = "0.34.0"
+fastapi = "0.115.8"
+langchain-chroma = "0.2.3"
+jieba = "0.42.1"
+langchain = "0.3.23"
+langchain-community = "0.3.21"
+rank-bm25 = "0.2.2"
+pybase64 = "1.3.0"
+mcp = "^1.12.0"
+pymysql = "^1.1.1"
+posthog = "5.4.0"
+langchain-openai = "0.3.16"
+langsmith = "0.3.33"
+line-bot-sdk = "^3.18.1"
+mysql-connector-python = "^9.4.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
