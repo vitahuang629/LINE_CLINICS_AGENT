@@ -24,10 +24,9 @@ def set_appointment(symptom: str) -> dict:
             "請提供以下資訊：\n"
             "1. 預約姓名：\n"
             "2. 想做的療程：\n"
-            "3. 期望時間：(mm/dd/yyyy)：\n"
-            "4. 期望時間範圍（平日 / 假日 / 上午 / 下午）：\n"
-            "5. 特殊需求（怕痛、敏感膚質、懷孕等）：\n"
-            "6. 聯絡方式（電話、Email）：\n"
+            "3. 期望日期及時間：(mm/dd)：\n"
+            "4. 特殊需求（怕痛、敏感膚質、懷孕等）：\n"
+            "5. 聯絡電話：\n"
             "收到您的預約訊息後，我會盡快請專人幫您安排！"
         ),
         "should_terminate": True
@@ -37,6 +36,7 @@ def set_appointment(symptom: str) -> dict:
 def search_clinics_by_keyword(symptom: str) -> str:
     """
     根據用戶輸入的症狀或關鍵字，根據這個症狀合理詢問大約兩次並關心用戶，接著查詢診所內相關醫美療程，並提供介紹說明。
+    若偵測到使用者在問對比照或是療程效果，需先確認療程項目再回答。
     """
     print(f"Tool called with: {symptom}")
 
@@ -60,160 +60,238 @@ def search_clinics_by_keyword(symptom: str) -> str:
         "這些療程皆能幫助改善您的狀況，"
         "建議您可以與本診所的專業醫師或諮詢師進一步討論，"
         "我也可以協助您預約本診所的療程喔！"
-    )
+    )   
+
+
+# @tool
+# def search_clinics_info(question: str) -> str:
+#     """
+#     根據用戶問診所資訊（地址、電話、療程初診費用），
+#     若偵測到使用者在問費用、體驗價或初診，需先確認療程項目再回答。
+#     """
+#     print(f"Original question: {question}")
+
+#     # ✅ Step 1. 嘗試從 question 偵測療程名稱
+#     treatments = ["Emface", "腦波機", "紅光", "無限電波", "NightLase", "止鼾", "EECP", "DeepTMS"]
+#     detected_treatment = None
+#     for t in treatments:
+#         if t.lower() in question.lower():
+#             detected_treatment = t
+#             break
+
+#     # ✅ Step 2. 若沒有提到療程名稱，嘗試用 LLM 或上文的 context 來補
+#     # （這裡示範簡單版本：若沒偵測到，請 AI 直接詢問使用者）
+#     if not detected_treatment:
+#         print("未偵測到療程名稱，詢問使用者或上文補足。")
+#         return "請問您想了解哪個療程的初診費用呢？（例如：Emface、腦波機、紅光）"
+
+#     # ✅ Step 3. 重寫 question（在前面補上療程名稱）
+#     full_question = f"{detected_treatment} 初診費 {question}"
+#     print(f"Info tool called with: {full_question}")
+
+#     # ✅ Step 4. 呼叫 retriever
+#     # docs = qa_retriever.get_relevant_documents(full_question)
+#     docs = qa_retriever(full_question)
+#     print('related_docs:', docs)
+
+#     if not docs:
+#         return f"抱歉，我找不到「{question}」的資訊。"
+
+#     # 只回傳答案，不加 AI 生成
+#     content = docs[0].page_content
+#     if "答案：" in content:
+#         answer = content.split("答案：", 1)[1].split("\n")[0].strip()
+#     else:
+#         answer = content.strip()
+
+#     # return answer
+#     return docs[0].page_content
+
 
 @tool
-def search_clinics_info(question: str) -> str:
+# def search_clinics_info(question: str, category: str = "費用") -> str:
+def search_clinics_info(treatment_name: str, category: str = "費用") -> str:
+
+    # """
+    # 根據用戶問診所資訊（地址、電話、療程初診費用），
+    # 若偵測到使用者在問費用、體驗價或初診，需先確認療程項目再回答。
+    # """
     """
-    根據用戶問診所資訊（地址、電話、初診費用），只回傳固定答案。
+    查詢診所特定療程的資訊。
+    參數:
+    - treatment_name: 療程名稱 (例如: 瘦瘦筆, EMBODY, NEO, Emface)
+    - category: 查詢類別 (費用, 地址, 電話)
     """
-    print(f"Info tool called with: {question}")
+    print(f"Target Treatment: {treatment_name}, Category: {category}")
+    boosted_query = f"{treatment_name} {treatment_name} {treatment_name} {category}"
+    print(f"Boosted Query: {boosted_query}")
 
 
-    # retriever = get_qa_retriever()  # ← 取得 Q&A retriever
-    print('I got the retriever')
-    docs = qa_retriever.get_relevant_documents(question)
-    print('relatedddddddddddddddddd_docs', docs)
-
+    # --- Step 2. 呼叫 retriever ---
+    docs = qa_retriever.get_relevant_documents(boosted_query)
     if not docs:
-        return f"抱歉，我找不到「{question}」的資訊。"
+        return f"抱歉，我找不到「{boosted_query}」的資訊。"
 
-    # 只回傳答案，不加 AI 生成
+    # --- Step 3. 只回傳答案 ---
     content = docs[0].page_content
-    if "答案：" in content:
-        answer = content.split("答案：", 1)[1].split("\n")[0].strip()
-    else:
-        answer = content.strip()
+    return content
+    # print(f"Original question: {question}")
 
-    # return answer
-    return docs[0].page_content
+    # --- Step 1. 偵測是否是費用相關問題 ---
+    # fee_keywords = ["費用", "初診", "體驗價"]
+    # if any(kw in question for kw in fee_keywords):
+    #     treatments = ["Emface", "腦波機", "紅光", "無限電波", "NightLase", "止鼾", "EECP", "DeepTMS", "EMBODY", "NEO"]
+    #     detected_treatment = None
+    #     for t in treatments:
+    #         if t.lower() in question.lower():
+    #             detected_treatment = t
+    #             break
+    #     # 拼接完整問題
+    #     full_question = f"{detected_treatment} 初診費 {question}"
+    #     print(f"Info tool called with: {full_question}")
+    # else:
+    #     full_question = question
+
+
+
 
 @tool
-def get_empathy_questions_by_symptom(symptom: str) -> dict:
+def get_empathy_questions_by_symptom(symptom_tag: str) -> dict:
     """
-    根據用戶輸入的症狀，提供適當的同理心關懷語句 (1 句) 與需要追問的問題 (最多 2 個)。
+    根據用戶輸入的症狀，提供適當的同理心關懷語句 (1 句) 與需要追問的問題 (1 個)。
     若症狀越具體，則提問越聚焦。
     - 關懷語句要溫柔簡短。
-    - 追問的問題要開放式，但避免超過 2 個。
+    - 追問的問題要開放式，但避免超過 1 個。
     - 如果 symptom 太模糊，只要問 1 個關鍵問題即可。
     """
-    print(f"Empathy tool called with: {symptom}")
+    print(f"Empathy tool called with: {symptom_tag}")
 
-
-# 假設你有一份事先整理好的字典
     symptom_map = {
-        "失眠": {
-            "empathy": "睡不好真的很辛苦，影響整天的精神狀態。",
-            "questions": [
-                "想先了解一下，您比較常遇到的狀況是哪一種呢？\n1️⃣ 入睡困難\n2️⃣ 睡不安穩、容易醒\n3️⃣ 半夜驚醒或打呼、呼吸中斷",
-                "平常這些狀況大概持續多久了呢？"
-            ]
-        },
-        "痘痘": {
-            "empathy": "痘痘冒出來一定很困擾，尤其會影響心情與自信。",
-            "questions": [
-                "目前痘痘大多是集中在哪些部位？",
-                "最近有特別熬夜、壓力大或飲食改變嗎？",
-                "你有嘗試使用藥膏或保養品處理嗎？"
-            ]
-        },
         "皺紋類": {
-            "keywords": ["皺紋", "法令紋", "木偶紋"],
-            "empathy": "皺紋的形成通常和膠原蛋白流失、表情肌活動或生活作息有關，很多人都會在意這部分的變化～別擔心，我們可以一起看看有哪些療程能幫助肌膚恢復緊緻與彈性。",
-            "general_questions":[
-                "想請問您皺紋主要集中在哪些部位呢？例如眼周、法令紋或額頭？",
-                "這些皺紋是靜態的（平常就明顯）還是表情時才比較明顯呢？",
-                "過去有嘗試過玻尿酸、肉毒或音波拉提等相關療程嗎？"
-            ],
-            "specific_questions": [
-                "您提到的是{}，想了解它是靜態的還是表情時才會比較明顯呢？",
-                "過去有嘗試過玻尿酸、肉毒或音波拉提等相關療程嗎？"
-            ]
+            "empathy": "我很理解您對細紋或紋路的在意，這確實是許多人追求自信時最關注的細節。",
+            "questions": ["過去有嘗試過相關的緊緻療程嗎？", "主要集中在哪一個部位？"]
         },
-        "胖": {
-            "empathy": "讓我們來協助你。體重問題常讓人焦慮，但你願意聊已經是很好的開始。",
-            "questions": [
-                "平時有在運動嗎？",
-                "飲食有特別控制嗎？"
-            ]
+        "私密療程": {
+            "empathy": "私密處的保養與健康確實非常重要，謝謝您願意信任並與我分享。 ",
+            "questions": ["您主要是想了解功能改善，還是日常的美觀保養呢？"]
         },
-        "減脂": {
-            "empathy": "讓我們來協助你。體重問題常讓人焦慮，但你願意聊已經是很好的開始。",
-            "questions": [
-                "請問本身有比較偏向哪些類型？\n1️. 無法控制飲食\n2️. 缺乏運動族群\n3️. 產後媽媽族群]\n4. 生活作息不規律\n5. 基因遺傳家族史\n6. 年紀漸長代謝下降 ",
-                "有接觸過療程的經驗嗎？或是實際諮詢檢測評估過狀況呢？"
-            ]
+        "睡眠與神經": {
+            "empathy": "長期睡不好或壓力大對身心負擔真的很高，我們會陪您一起找回舒適的休息品質。",
+            "questions": ["""方便進一步了解，請問目前有出現以下這些狀況嗎？/n
+                          1️⃣  睡不好、淺眠易醒、入睡困難/n2️⃣  睡覺會打呼、有呼吸中止情況/n
+                            3️⃣  長期依賴藥物，副作用明顯/n
+                            4️⃣  情緒緊繃、緊張焦慮不安/n
+                            5️⃣  心跳偏快、容易胸悶心悸/n
+                            6️⃣  記憶力下降、注意力變差/n
+                            7️⃣  頭痛、頭暈、耳鳴常發作/n
+                            8️⃣  胃食道逆流、脹氣、消化不良/n
+                            9️⃣  經常累沒精神、莫名身體痠痛""",
+                        "這種狀況持續多久了？會想了解如何透過腦波偵測來找出原因嗎？"]
         },
-        "打呼":{
-            "empathy": "睡覺打呼不僅影響自己，也可能影響身邊的人。",
-            "questions": [
-                "之前有看過甚麼門診治療嗎？",
-                "平時有側睡習慣嗎？"
-            ]
+        "體態管理": {
+            "empathy": "體態調整需要耐心與科學方法，願意開始了解就是很棒的第一步。",
+            "questions": ["了解您的情況了。為了更精確建議，請問您目前是偏向飲食習慣、運動缺乏，還是代謝問題比較困擾您呢？"]
+        },
+        "皮膚其他": {
+            "empathy": "皮膚出現痘痘或斑點確實讓人困擾，我們會協助您找回肌膚的健康狀態。",
+            "questions": ["目前的狀況大約持續多久了？有嘗試過什麼處理方式嗎？例如:保養品或曾做過其他醫美療程"]
         }
-        # 其他症狀……
     }
 
-    # 檢查是否與上次回應相同 10/14
-    # if last_response and last_response.get("empathy"):
-    #     #如果症狀相同且上次已經回應過，避免重複
-    #     last_empathy = last_response.get("empathy", "")
-    #     if any(keyword in symptom for keyword in ["皺紋", "法令紋", "木偶紋"]) and "皺紋的形成通常和膠原蛋白流失" in last_empathy:
-    #         return {
-    #             "empathy": "了解，讓我們繼續探討您的皺紋問題。",
-    #             "questions": []  # 不問重複問題
-    #         }
+    return symptom_map.get(symptom_tag, {
+        "empathy": "謝謝您的分享，我非常理解您的困擾。",
+        "questions": ["能再幫我多描述一下目前的狀況嗎？"]
+    })
+# 假設你有一份事先整理好的字典
+    # symptom_map = {
+    #     "失眠": {
+    #         "empathy": "睡不好真的很辛苦，影響整天的精神狀態。",
+    #         "questions": [
+    #             "想先了解一下，您比較常遇到的狀況是哪一種呢？\n1️⃣ 入睡困難\n2️⃣ 睡不安穩、容易醒\n3️⃣ 半夜驚醒或打呼、呼吸中斷",
+    #             "平常這些狀況大概持續多久了呢？"
+    #         ]
+    #     },
+    #     "痘痘": {
+    #         "empathy": "痘痘冒出來一定很困擾，尤其會影響心情與自信。",
+    #         "questions": [
+    #             "目前痘痘大多是集中在哪些部位？",
+    #             "最近有特別熬夜、壓力大或飲食改變嗎？",
+    #             "你有嘗試使用藥膏或保養品處理嗎？"
+    #         ]
+    #     },
+    #     "皺紋類": {
+    #         "keywords": ["皺紋", "法令紋", "木偶紋"],
+    #         "empathy": "皺紋的形成通常和膠原蛋白流失、表情肌活動或生活作息有關，很多人都會在意這部分的變化～別擔心，我們可以一起看看有哪些療程能幫助肌膚恢復緊緻與彈性。",
+    #         "general_questions":[
+    #             "想請問您皺紋主要集中在哪些部位呢？例如眼周、法令紋或額頭？",
+    #             "這些皺紋是靜態的（平常就明顯）還是表情時才比較明顯呢？",
+    #             "過去有嘗試過玻尿酸、肉毒或音波拉提等相關療程嗎？"
+    #         ],
+    #         "specific_questions": [
+    #             "您提到的是{}，想了解它是靜態的還是表情時才會比較明顯呢？",
+    #             "過去有嘗試過玻尿酸、肉毒或音波拉提等相關療程嗎？"
+    #         ]
+    #     },
+    #     "胖": {
+    #         "empathy": "讓我們來協助你。體重問題常讓人焦慮，但你願意聊已經是很好的開始。",
+    #         "questions": [
+    #             "平時有在運動嗎？",
+    #             "飲食有特別控制嗎？"
+    #         ]
+    #     },
+    #     "減脂": {
+    #         "empathy": "讓我們來協助你。體重問題常讓人焦慮，但你願意聊已經是很好的開始。",
+    #         "questions": [
+    #             "請問本身有比較偏向哪些類型？\n1️. 無法控制飲食\n2️. 缺乏運動族群\n3️. 產後媽媽族群]\n4. 生活作息不規律\n5. 基因遺傳家族史\n6. 年紀漸長代謝下降 ",
+    #             "有接觸過療程的經驗嗎？或是實際諮詢檢測評估過狀況呢？"
+    #         ]
+    #     },
+    #     "打呼":{
+    #         "empathy": "睡覺打呼不僅影響自己，也可能影響身邊的人。",
+    #         "questions": [
+    #             "之前有看過甚麼門診治療嗎？",
+    #             "平時有側睡習慣嗎？"
+    #         ]
+    #     }
+    #     # 其他症狀……
+    # }
 
-    # === 關鍵字比對邏輯 ===
-    # for key, info in symptom_map.items():
-    #     if "keywords" in info:  # 有多關鍵字設定的情況
-    #         if any(k in symptom for k in info["keywords"]):
-    #             return {
-    #                 "empathy": info["empathy"],
-    #                 "questions": info["questions"][:2] #最多2個問題
-    #             }
-    #     elif key in symptom:
-    #         return {
-    #             "empathy": info["empathy"],
-    #             "questions": info["questions"][:2]
-    #         }
-    # --- 找出對應類別 ---
-    for category, data in symptom_map.items():
-        for keyword in data["keywords"]:
-            if keyword in symptom:
-                empathy = data["empathy"]
+    # for category, data in symptom_map.items():
+    #     for keyword in data["keywords"]:
+    #         if keyword in symptom:
+    #             empathy = data["empathy"]
 
-                # 根據具體程度分流
-                if symptom == "皺紋":
-                    # 模糊症狀 → 問範圍
-                    return {
-                        "empathy": empathy,
-                        "questions": data["general_questions"]
-                    }
-                else:
-                    # 具體症狀 → 問狀況/需求
-                    specific_qs = [q.format(symptom) if "{}" in q else q for q in data["specific_questions"]]
-                    return {
-                        "empathy": empathy,
-                        "questions": specific_qs
-                    }
+    #             # 根據具體程度分流
+    #             if symptom == "皺紋":
+    #                 # 模糊症狀 → 問範圍
+    #                 return {
+    #                     "empathy": empathy,
+    #                     "questions": data["general_questions"]
+    #                 }
+    #             else:
+    #                 # 具體症狀 → 問狀況/需求
+    #                 specific_qs = [q.format(symptom) if "{}" in q else q for q in data["specific_questions"]]
+    #                 return {
+    #                     "empathy": empathy,
+    #                     "questions": specific_qs
+    #                 }
         
     
-    fallbacks = [
-        {
-            "empathy": "我懂，這樣的狀況一定不好受。",
-            "questions": ["方便多分享一些細節嗎？"]
-        },
-        {
-            "empathy": "聽起來真的讓人困擾。",
-            "questions": ["想請問大多是在什麼情況下發生呢？"]
-        },
-        {
-            "empathy": "謝謝你願意分享。",
-            "questions": ["能再說說具體的感受或影響嗎？"]
-        }
-    ]
-    return random.choice(fallbacks)
+    # fallbacks = [
+    #     {
+    #         "empathy": "我懂，這樣的狀況一定不好受。",
+    #         "questions": ["方便多分享一些細節嗎？"]
+    #     },
+    #     {
+    #         "empathy": "聽起來真的讓人困擾。",
+    #         "questions": ["想請問大多是在什麼情況下發生呢？"]
+    #     },
+    #     {
+    #         "empathy": "謝謝你願意分享。",
+    #         "questions": ["能再說說具體的感受或影響嗎？"]
+    #     }
+    # ]
+    # return random.choice(fallbacks)
 
     # return {
     #     "empathy": "我了解你目前的困擾。",

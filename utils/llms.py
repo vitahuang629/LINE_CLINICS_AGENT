@@ -27,7 +27,7 @@ class LLMModel:
 #     使用 LangChain 的 ChatOllama 與自部署的 Ollama 模型進行互動。
 #     這個類別封裝了模型的初始化，並使其與 LangChain 的功能 (如 with_structured_output) 相容。
 #     """
-#     def __init__(self, model_name="ycchen/breeze-7b-instruct-v1_0", ollama_base_url="http://3.115.142.115:11434", use_json_format = False ):
+#     def __init__(self, model_name="ycchen/breeze-7b-instruct-v1_0", ollama_base_url=OLLAMA_URL, use_json_format = False ):
 #         """
 #         初始化 LLMModel。
 

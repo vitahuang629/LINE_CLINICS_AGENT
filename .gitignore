@@ -2,7 +2,7 @@ venv/
 *.env
 data/
 notebook/
-__pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -10,3 +10,19 @@ __pycache__/
 *.sqlite3
 # System files
 .DS_Store
+customer_service_texts.ipynb
+line_chats_batch_1.csv
+line_chats_batch_2.csv
+line_chats_batch_3.csv
+line_chats_batch_4.csv
+line_chats_batch_5.csv
+line_chats_batch_6.csv
+line_chats_batch_7.csv
+line_chats_batch_8.csv
+line_chats_batch_9.csv
+line_chats_batch_10.csv
+line_chats_batch_11.csv
+line_chats_batch_12.csv
+chroma_qa/
+chroma_token_split/
+utils/chroma_qa/

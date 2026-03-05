@@ -1,0 +1,1 @@
+poetry run python main_execute.py & poetry run python main_webhook.py

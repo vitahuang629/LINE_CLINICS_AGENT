@@ -26,7 +26,12 @@ langchain-openai = "0.3.16"
 langsmith = "0.3.33"
 line-bot-sdk = "^3.18.1"
 mysql-connector-python = "^9.4.0"
+easyocr = "^1.7.2"
+scikit-learn = "^1.8.0"
 
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^7.1.0"
 
 [build-system]
 requires = ["poetry-core"]

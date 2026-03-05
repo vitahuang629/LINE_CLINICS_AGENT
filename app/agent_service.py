@@ -2,6 +2,8 @@ from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from .models import UserQuery
 from agent import DoctorAppointmentAgent
 from typing import List
+import asyncio
+from typing import List, Dict
 
 agent = DoctorAppointmentAgent()
 

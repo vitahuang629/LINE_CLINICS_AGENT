@@ -8,6 +8,17 @@ import pickle
 import pandas as pd
 import jieba
 from utils.shared_resources import embedding_model, chinese_tokenizer
+from typing import List
+
+
+def reciprocal_rank_fusion(*ranked_lists, k=60) -> List[str]:
+    scores = {}
+    for rl in ranked_lists:
+        for rank, doc_id in enumerate(rl, start=1):  # rank 從 1 開始 / Rank is 1-based
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+
+    fused = sorted(scores.items(), key=lambda x: (-x[1], x[0]))  # 排序並融合 / Sort fused scores
+    return [d for d, _ in fused]
 
 # 中文斷詞
 # def chinese_tokenizer(text):
@@ -69,13 +80,38 @@ def get_qa_retriever():
     # --- Ensemble (語意 + 關鍵字) ---
     qa_retriever = EnsembleRetriever(
         retrievers=[vector_retriever, bm25_retriever],
-        weights=[0.2, 0.8]  # 關鍵字比重高一點
+        weights=[0.7, 0.3]  # 關鍵字比重低一點
     )
 
     return qa_retriever
+    # def fused_retrieve(query: str, top_k: int = 5):
+    #     # 取出各自結果
+    #     bm25_results = bm25_retriever.get_relevant_documents(query)
+    #     vector_results = vector_retriever.get_relevant_documents(query)
+
+    #     # 取出 document_id 以利 RRF
+    #     bm25_ids = [str(d.metadata["document_id"]) for d in bm25_results]
+    #     vector_ids = [str(d.metadata["document_id"]) for d in vector_results]
+
+    #     # 用 RRF 融合排序
+    #     fused_ids = reciprocal_rank_fusion(bm25_ids, vector_ids)
+
+    #     # 根據融合後的排序回傳 Document
+    #     id_to_doc = {str(d.metadata["document_id"]): d for d in qa_documents_vector}
+    #     fused_docs = [id_to_doc[i] for i in fused_ids[:top_k] if i in id_to_doc]
+
+    #     return fused_docs
+    
+    # return fused_retrieve
 
 # if __name__ == "__main__":
 #     retriever = get_qa_retriever()
 #     docs = retriever.get_relevant_documents("地址")
+#     for i, doc in enumerate(docs):
+#         print(f"Doc {i+1}: {doc.page_content}")
+
+# if __name__ == "__main__":
+#     retriever = get_qa_retriever()
+#     docs = retriever("地址?")  # ← 直接呼叫 retriever()，不是 .get_relevant_documents()
 #     for i, doc in enumerate(docs):
 #         print(f"Doc {i+1}: {doc.page_content}")

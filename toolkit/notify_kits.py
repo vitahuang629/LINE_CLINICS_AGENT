@@ -14,7 +14,7 @@ def check_appointment_keywords(response_text: str) -> bool:
     檢查 AI 回覆中是否包含預約相關的關鍵字
     """
     appointment_keywords = [
-        "送出", "紀錄", "稍後", "盡快", "專人"
+        "送出", "紀錄", "稍後", "盡快", "專人", "通知"
     ]
     
     # 計算關鍵字出現次數

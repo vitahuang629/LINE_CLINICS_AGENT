@@ -1,19 +1,20 @@
 import os
 import requests
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage, TemplateSendMessage, ButtonsTemplate, URITemplateAction, MessageTemplateAction, JoinEvent
 from fastapi import Request
 from .utils import is_valid_phone_number
 from dotenv import load_dotenv
 import mysql.connector
 from toolkit.notify_kits import check_appointment_keywords
+import re
+import random
 
 load_dotenv()
 
-DB_PASS=os.getenv("OPENAI_API_KEY")
+DB_PASS=os.getenv("DB_PASS")
 GROUP_ID=os.getenv("GROUP_ID")
-
 
 # === MySQL 連線 ===
 def get_db_connection():
@@ -99,14 +100,14 @@ def handle_message(event: MessageEvent):
             line_bot_api.reply_message(
                 reply_token,
                 [TextSendMessage(text="""請先輸入您的手機號碼（格式：09xxxxxxxx）\n您好，我是霍普艾小編，很高興為您服務😊"""),
-                 TextSendMessage(text="""我們霍普金斯聯名診所位於（永春捷運站５號出口旁）\n🔹診所地點：台北市信義區忠孝東路五段477-6號\n🔹看診時段：週一到週六：11:15~20:00\n🔺最晚預約時間為19:00，建議提前預約\n⚠️週日固定公休（特定假期另行公告）
+                 TextSendMessage(text="""我們診所結合【科學根據及科技原理】提供減脂減重、身材雕塑、睡眠問題、肌膚保養、抗衰逆齡、私密處保養，針對不同狀況做加強協助達到更理想的狀況😊）
                     """)])
             return
         # 存手機號碼（記憶體或 DB 都可以）
         user_phone_map[user_id] = user_text
         line_bot_api.reply_message(
             reply_token,
-            TextSendMessage(text=f"手機號碼已記錄：{user_text}，可以開始諮詢療程了！")
+            TextSendMessage(text=f"手機號碼已記錄：{user_text}，請告訴我您的年齡以及症狀喔~")
         )
         return
 
@@ -114,6 +115,21 @@ def handle_message(event: MessageEvent):
 
     # 1️⃣ 儲存使用者訊息到 DB
     insert_message(user_id, "user", user_text)
+
+    # 🧩 高風險關鍵詞安全檢查
+    HIGH_RISK_KEYWORDS = ["FM2", "fm2", "安眠藥", "鎮定劑"]
+    if any(word in user_text for word in HIGH_RISK_KEYWORDS):
+        warning_message = """提醒：
+    藥物治療僅適合用於初期短效輔助，很多人為了解決睡眠或情緒問題而依賴藥物，但其實藥物只是「強迫大腦關機」，會使得無法正常運行進入（深層睡眠狀態來分泌脊髓液，幫助排毒、修復細胞，讓身心徹底恢復能量）。
+
+    藥物僅適合在專業醫師指導下短期使用，長期服用可能造成依賴與副作用：
+    🔸 記憶力、專注力下降
+    🔸 睡眠品質惡化、焦慮加劇
+    🔸 肝腎代謝負擔增加
+    建議您與專業醫師討論替代的非藥物治療方式（如腦波調節）。
+    """
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=warning_message))
+        return  # 🚫 不呼叫 AI，直接結束這輪處理
 
     # 2️⃣ 取得歷史對話（包含剛剛存的）
     history = get_message_history(user_id)
@@ -126,6 +142,8 @@ def handle_message(event: MessageEvent):
     try:
         res = requests.post(API_URL, json=payload, verify=False)
         ai_reply = res.json().get("messages", "抱歉，目前無法回覆。")
+        # photo_urls = res.json().get("photo_urls", [])     #1023
+        # send_line_message(user_id=user_id, ai_reply=ai_reply, image_urls=photo_urls) #1023
     except Exception as e:
         ai_reply = f"呼叫 API 發生錯誤: {e}"
 
@@ -139,18 +157,25 @@ def handle_message(event: MessageEvent):
     # print(profile.picture_url)    # 頭像
     # print(profile.status_message) # 狀態訊息
 
+    # url_pattern = r'https?://[^\s]+(?:jpg|jpeg|png|webp)'
+    url_pattern = r'https://[^\s)>\]\'"]+\.(?:jpg|jpeg|png|webp)'
+    urls = re.findall(url_pattern, ai_reply)
+    print('all_urlssssssssssss', urls)
+
+    clean_text = re.sub(url_pattern, '', ai_reply).strip()
+    # 移除多餘的空行
+    clean_text = re.sub(r'\n\s*\n', '\n', clean_text)
+
     if "睡眠障礙與自律神經失調" in user_text:
         # 5️⃣ 回覆 LINE
         # line_bot_api.reply_message(reply_token, TextSendMessage(text=ai_reply))   #0926 如果只有單一回復文字
-        message = [# ImageSendMessage( #傳圖片
-        #                 original_content_url="https://www.bing.com/images/search?view=detailV2&ccid=6PW5h7ap&id=946E94F5329BE74B489D75E59638585FB2E94040&thid=OIP.6PW5h7ap9WzNHV0mP2bOtAHaEK&mediaurl=https%3A%2F%2Fi.pinimg.com%2Foriginals%2F51%2F49%2F8e%2F51498ef3c0cb498e6c64eceaa3c332d0.jpg&exph=405&expw=720&q=imgurl%3Ahttps%3A%2F%2Fwww.nornsblog.com%2Fwp-content%2Fuploads%2FLotso9-768x432.jpg&form=vissbi&ck=FF82B673E49143F530968658A70B6B37&selectedindex=2&itb=0&cw=1721&ch=832&first=1&insightstoken=ccid_SxoXKjT8*cp_3C414757C366C5DFE2ED0CFC01736CC0*mid_2A0B9D63CFB61DA5122142475093EA1CAE43E00F*thid_OIP.SxoXKjT8MyvKLTbjE-nrNwHaEK&iss=VSI&vt=2&vsimg=https%3A%2F%2Fwww.nornsblog.com%2Fwp-content%2Fuploads%2FLotso9-768x432.jpg&sim=11&pivotparams=insightsToken%3Dccid_pNYytZoE*cp_C1B3BEF5C77302D46BF65E4481A49DC6*mid_1F8028C823C0227546EE6748347870CCCFB3D32F*thid_OIP.pNYytZoETY4!_o4PG6kdJWgHaHa&cdnurl=https%3A%2F%2Fth.bing.com%2Fth%2Fid%2FR.e8f5b987b6a9f56ccd1d5d263f66ceb4%3Frik%3DQEDpsl9YOJbldQ%26pid%3DImgRaw%26r%3D0",
-        #                 preview_image_url="https://www.bing.com/images/search?view=detailV2&ccid=pNYytZoE&id=1F8028C823C0227546EE6748347870CCCFB3D32F&thid=OIP.pNYytZoETY4_o4PG6kdJWgHaHa&mediaurl=https%3A%2F%2F64.media.tumblr.com%2Ftumblr_nj1j4qAKXD1t2csxzo1_1422706202_cover.jpg&exph=500&expw=500&q=imgurl%3Ahttps%3A%2F%2Fwww.nornsblog.com%2Fwp-content%2Fuploads%2FLotso9-768x432.jpg&form=vissbi&ck=C1B3BEF5C77302D46BF65E4481A49DC6&selectedindex=1&itb=0&cw=1721&ch=832&first=1&insightstoken=ccid_SxoXKjT8*cp_3C414757C366C5DFE2ED0CFC01736CC0*mid_2A0B9D63CFB61DA5122142475093EA1CAE43E00F*thid_OIP.SxoXKjT8MyvKLTbjE-nrNwHaEK&iss=VSI&vt=2&vsimg=https%3A%2F%2Fwww.nornsblog.com%2Fwp-content%2Fuploads%2FLotso9-768x432.jpg&sim=11&pivotparams=insightsToken%3Dccid_%252BCusoKTw*cp_D40C56886C7BEAE888406E02D9C4998F*mid_312250FD39FE39B141B031E555FF6768AF2F8E4F*thid_OIP.-CusoKTw8ICcYkwKlZBWMgHaDm&cdnurl=https%3A%2F%2Fth.bing.com%2Fth%2Fid%2FR.a4d632b59a044d8e3fa383c6ea47495a%3Frik%3DL9Ozz8xweDRIZw%26pid%3DImgRaw%26r%3D0"
-        #             ),
-                    TextSendMessage(text=ai_reply),
+        message = [
+                    TextSendMessage(text=clean_text),
                     TemplateSendMessage(
                     alt_text="睡眠與自律神經失調",
                     template=ButtonsTemplate(
-                        thumbnail_image_url="https://th.bing.com/th/id/R.f82baca0a4f0f0809c624c0a95905632?rik=T44vr2hn%2f1XlMQ&riu=http%3a%2f%2fwww.falpala.it%2fwp-content%2fuploads%2f2013%2f08%2forso-rosa.jpg&ehk=XzHyy3P3%2bmprTkahh65p3dtu5mEp9UYZ%2fvsLzr1eMRY%3d&risl=&pid=ImgRaw&r=0",
+                        #thumbnail_image_url="https://th.bing.com/th/id/R.f82baca0a4f0f0809c624c0a95905632?rik=T44vr2hn%2f1XlMQ&riu=http%3a%2f%2fwww.falpala.it%2fwp-content%2fuploads%2f2013%2f08%2forso-rosa.jpg&ehk=XzHyy3P3%2bmprTkahh65p3dtu5mEp9UYZ%2fvsLzr1eMRY%3d&risl=&pid=ImgRaw&r=0",
+                        thumbnail_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/parking_lots.jpg",
                         title="Deep TMS-腦波科技",
                         text="國際認證非藥物、無侵入性治療，以磁場技術，刺激大腦神經元迴路，調節自律神經、改善失眠焦慮，幫助身心重新找回平衡與放鬆。",
                         actions=[
@@ -169,6 +194,77 @@ def handle_message(event: MessageEvent):
                         ]
                     )
                 )
+        ]
+    elif "兩種方案" in ai_reply or "自律神經檢測" in ai_reply:
+        message = [
+                  TextSendMessage(text=clean_text),
+                  ImageSendMessage(
+                      original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/treatment_procedure.jpg",
+                      preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/treatment_procedure.jpg"
+                  )
+        ]
+        message.append(ImageSendMessage(
+                original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/autonomic_fees.jpg",
+                preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/autonomic_fees.jpg"
+            ))
+    elif any(kw in ai_reply for kw in ["體態檢測", "EMBODY", "NEO", "瘦瘦筆"]) and "檢測" in ai_reply:
+        print('444444444444444444444')
+        message = [
+                  #TextSendMessage(text="""可以先幫您安排【免費諮詢＋檢測評估】可以更加了解目前的實際狀況，✅️例如：皮下脂肪、內臟脂肪、肌肉量、基礎代謝率、腹直肌分離、 BMI等指數，依據科學指標數據來規劃適合您的方式，確保達到理想效果！再考慮是否進行💕
+                  #            """),
+                  TextSendMessage(text=clean_text),
+                  ImageSendMessage(
+                      original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/body_consult.jpg",
+                      preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/body_consult.jpg"
+                  )
+        ]
+    elif "地址" in ai_reply or "地點" in ai_reply or "哪裡" in user_text or "位於" in ai_reply or "停車" in user_text or "停車場" in user_text or "開車" in user_text:
+        message = [TextSendMessage(text = """🔶愛買超市停車場➜(忠孝東路五段297號附有地下三樓)\n🔶春光公園停車場➜(台北市信義區忠孝東路五段666號)\n兩個停車場步行診所約莫5分鐘內可到達，建議可以停放『春光公園停車場』，車位比較多唷😉
+                                    """),
+                    ImageSendMessage( #傳圖片
+                    original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/parking_lots.jpg",
+                    preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/parking_lots.jpg"
+                            )]
+    elif "Emface" in ai_reply and "電波" not in ai_reply:
+        print('5555555555555')
+        print(urls)
+        if urls: 
+            print('uuuuuuuuuuuuuuuuuuuuuuuurrrrrrrrrrrr')
+            contrast_url = urls[0]
+            message = [
+                    TextSendMessage(text=clean_text),
+                    ImageSendMessage(
+                        original_content_url=contrast_url,
+                        preview_image_url=contrast_url
+                    )
+            ]
+            # message.append(ImageSendMessage(
+            #     original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/emface_intro.jpg",
+            #     preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/emface_intro.jpg"
+            # ))
+        elif "免費" in ai_reply:
+            print('nonooooooooooooooooooooooo')
+            message = [
+                    TextSendMessage(text=ai_reply),
+                    ImageSendMessage(
+                        original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/emface_intro.jpg",
+                        preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/emface_intro.jpg"
+                    )
+            ]
+    elif "瘦瘦筆" in ai_reply and ("EMBODY" not in ai_reply and "NEO" not in ai_reply and "SIS" not in ai_reply):
+        message = [
+                    TextSendMessage(text=ai_reply),
+                    ImageSendMessage(
+                        original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/skin_pencial_intro.jpg",
+                        preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/skin_pencial_intro.jpg"
+                    )
+            ]
+    elif urls:
+        print('6666666666666666666')
+        print(urls)
+        message = [
+            TextSendMessage(text=clean_text),
+            ImageSendMessage(original_content_url=urls[0], preview_image_url=urls[0])
         ]
     else:
         message = TextSendMessage(text=ai_reply)

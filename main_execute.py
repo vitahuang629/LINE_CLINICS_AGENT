@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from app.models import UserQuery
 from app.agent_service import execute_agent
+import asyncio
 
 
 app = FastAPI()
@@ -12,7 +13,6 @@ def execute(user_input: UserQuery):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8003)
-
 
 
 # from fastapi import FastAPI
