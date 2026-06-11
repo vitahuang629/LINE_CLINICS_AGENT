@@ -1,0 +1,72 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+*.egg-info
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE / Editor
+.vscode
+.idea
+*.swp
+
+# Environment（很重要，避免把 .env 包進 image）
+.env
+.env.local
+.env.*
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Tests / 舊路徑（這個 repo 有不少）
+tests/
+test_*.py
+*_test.py
+*_old_backup.py
+streamlit_ui.py
+main_execute.py
+app/agent_service.py
+
+# Documentation / 圖檔（不需要進 image）
+*.md
+docs/
+images/
+diagrams/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+architecture.*
+
+# 啟動時會自動重建的 cache（不要進 image，避免帶舊索引上線）
+bm25.pkl
+bm25_qa.pkl
+chroma_qa/
+chroma_token_split/
+checkpoints.sqlite*
+
+# Build artifacts
+build/
+dist/
+
+# Notebook
+*.ipynb
+.ipynb_checkpoints
+
+# Docker 本身
+Dockerfile*
+.dockerignore
+docker-compose*.yml

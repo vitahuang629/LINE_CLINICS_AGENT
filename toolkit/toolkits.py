@@ -1,35 +1,142 @@
 import pandas as pd
 from typing import Literal, Dict, Any
+from contextvars import ContextVar
 from langchain_core.tools import tool
 from data_models.models import DateModel, DateTimeModel, IdentificationNumberModel
 import os
 from utils.ensemble_retriever import get_ensemble_retriever
 from utils.qa_retriever import get_qa_retriever
+from utils.consult_plan import get_consult_info
 import random
 
 print("toolkits.py is running")
 qa_retriever = get_qa_retriever()
 ensemble_retriever = get_ensemble_retriever()
 
+# 每個 request 範圍的「合法療程」集合
+# search_clinics_by_keyword 被呼叫時會把 retriever 回的療程名加進來
+# 由 backend_agent_service 在 request 開始時 reset、結束時讀取
+authorized_treatments_var: ContextVar = ContextVar("authorized_treatments", default=None)
+
+# 療程同義詞 / 別名群組：每一組代表「同一個療程」的不同講法（正規名、學名、英文、暱稱）
+# 用途：sanitize 檢查時，只要某一組裡有「正規名」這輪真的被 retriever 撈到（出現在
+#       authorized_treatments_var），同組的其他別名就一起視為合法，避免把正確的學名/別名誤判為幻覺。
+#       （例：腦波機這輪被檢索到 → 它的學名 DeepTMS / 深層經顱磁刺激 也放行）
+# ⚠️ 維護原則：要和 agent.py 的「療程名稱白名單」（約 339-346 行）保持一致，新增療程兩邊都要改。
+TREATMENT_SYNONYMS: list = [
+    {"腦波機", "DeepTMS", "深層經顱磁刺激"},
+    {"Emface", "菲斯波"},
+    {"無限電波"},
+    {"皮秒", "PicosurePRO"},
+    {"NEO", "熱磁減脂"},
+    {"EMBODY"},
+    {"冷凍減脂", "冷脈衝"},
+    {"SIS"},
+    {"瘦瘦筆", "週纖達"},
+    {"Alma Duo", "震波"},
+    {"FemiLift"},
+    {"G動椅", "Emsella"},
+    {"EECP"},
+    {"PBM", "紅光", "PBM紅光"},
+    {"NightLase", "止鼾雷射", "NightLase無創雷射止鼾"},
+]
+
+
+# 診所基本資訊（地址 / 交通 / 看診時間 / 電話 / 停車）全擠在 clinics_qa「診所地點」那一筆。
+# 短查詢（「地址」「怎麼去」）用模糊檢索常被別的 row 插隊甚至撈不到，
+# 所以這類意圖直接回傳該筆，不賭向量 / BM25 排名。模組載入時抓一次。
+def _load_clinic_basic_info():
+    try:
+        df = pd.read_csv("data/clinics_qa.csv", encoding="utf-8-sig")
+    except Exception as e:
+        print(f"[clinic_info] 載入 clinics_qa.csv 失敗：{e}")
+        return None
+    for _, row in df.iterrows():
+        q = str(row.get("question", "")).strip()
+        cat = str(row.get("category", "")).strip()
+        if q == "診所地點" or cat == "交通":
+            return str(row.get("answer", "")).strip()
+    print("[clinic_info] 找不到『診所地點』那筆（question=診所地點 / category=交通）")
+    return None
+
+
+CLINIC_BASIC_INFO = _load_clinic_basic_info()
+print(f"[clinic_info] 診所基本資訊 {'已載入' if CLINIC_BASIC_INFO else '缺失'}")
+
+# 命中以下任一意圖（出現在 agent 傳進來的 category）→ 直接回診所基本資訊那筆
+CLINIC_INFO_INTENT = (
+    "地址", "地點", "位置", "交通", "在哪", "在那",
+    "怎麼去", "怎麼走", "怎麼到", "怎麼抵達", "搭車", "搭乘",
+    "公車", "捷運", "開車", "停車", "電話", "聯絡",
+    "看診", "營業", "幾點", "到達", "可以到嗎"
+)
+
+
+# 防呆用：症狀「分類標籤」→ 療程資料庫裡真實會出現的症狀詞。
+# 這些標籤（皺紋類、皮膚其他…）是給 get_empathy_questions_by_symptom 用的分類桶，
+# 標籤字串本身不在任何療程內文/關鍵字裡。若 LLM 誤把標籤傳進 search_clinics_by_keyword，
+# 直接拿去檢索會撈不到正確療程（例：傳「皺紋類」會把 Emface 排掉），
+# 故在檢索前先把標籤展開成真實症狀詞。詞彙對齊 clinics_introductions3.csv 的 keywords。
+TAG_TO_KEYWORDS: dict = {
+    "皺紋類": "法令紋 木偶紋 細紋 皺紋 紋路 抬頭紋 眼尾紋 嘴角細紋",
+    "皮膚其他": "痘痘 斑點 膚色不均 肌膚暗沉 毛孔",
+    "體態管理": "減脂 瘦身 局部雕塑 肚子 體態",
+    "私密療程": "私密處 性功能 緊緻",
+    "睡眠與神經": "失眠 睡不好 打呼 自律神經 壓力 心悸",
+}
+
+
 @tool
 def set_appointment(symptom: str) -> dict:
     """
-    根據用戶輸入的文字，如果有想要預約療程的動機，
-    接著詢問想要體驗的醫美療程，並回傳要詢問的欄位。
+    第一階段：當客人「首次表達」預約意願時呼叫此工具，
+    回傳一段要客人填寫的預約欄位（姓名、療程、時間、特殊需求、電話）。
+    呼叫此工具**不會**觸發轉真人客服，只是顯示表單。
     """
-    print(f"Appointment Tool called with: {symptom}")
+    print(f"set_appointment called with: {symptom}")
 
     return {
         "appointment_info": (
-            "請提供以下資訊：\n"
+            "好的！請提供以下資訊我幫您安排：\n"
             "1. 預約姓名：\n"
             "2. 想做的療程：\n"
             "3. 期望日期及時間：(mm/dd)：\n"
             "4. 特殊需求（怕痛、敏感膚質、懷孕等）：\n"
-            "5. 聯絡電話：\n"
-            "收到您的預約訊息後，我會盡快請專人幫您安排！"
+            "5. 聯絡電話："
         ),
         "should_terminate": True
+    }
+
+
+@tool
+def confirm_booking(
+    name: str,
+    treatment: str,
+    datetime_pref: str,
+    contact: str,
+    special_needs: str = "",
+) -> dict:
+    """
+    第二階段：當客人**已經填好預約資訊**（提供姓名、療程、時間、聯絡電話等）時呼叫此工具，
+    用於記錄預約意願並觸發轉接真人客服。
+
+    參數：
+    - name: 預約姓名
+    - treatment: 想做的療程
+    - datetime_pref: 期望日期及時間
+    - contact: 聯絡電話
+    - special_needs: 特殊需求（選填）
+
+    呼叫此工具會觸發轉接真人客服（CallCS=2）。
+    """
+    print(
+        f"confirm_booking called: name={name}, treatment={treatment}, "
+        f"time={datetime_pref}, contact={contact}, special_needs={special_needs}"
+    )
+
+    return {
+        "confirmation": "好的，已收到您的預約資訊，這邊幫您轉接專人進行後續安排，請稍候！",
+        "should_terminate": True,
     }
 
 @tool
@@ -40,6 +147,12 @@ def search_clinics_by_keyword(symptom: str) -> str:
     """
     print(f"Tool called with: {symptom}")
 
+    # 防呆：LLM 若誤傳分類標籤（如「皺紋類」），展開成資料庫真實症狀詞再檢索，
+    # 避免標籤字串檢索不到正確療程。正常傳原始症狀詞（如「法令紋」）則不受影響。
+    if symptom in TAG_TO_KEYWORDS:
+        expanded = TAG_TO_KEYWORDS[symptom]
+        print(f"[防呆] 偵測到分類標籤「{symptom}」→ 展開為「{expanded}」")
+        symptom = expanded
 
     # retriever = get_ensemble_retriever()  # ← 呼叫函式，取得 EnsembleRetriever 實體
     docs = ensemble_retriever.get_relevant_documents(symptom)
@@ -47,6 +160,17 @@ def search_clinics_by_keyword(symptom: str) -> str:
 
     if not docs:
         return f"目前找不到與「{symptom}」相關的療程。"
+
+    # 把這次 retriever 撈到的療程名收進 ContextVar（給後處理檢查用）
+    current_set = authorized_treatments_var.get()
+    if current_set is None:
+        current_set = set()
+    for doc in docs:
+        name = doc.metadata.get("clinic", "")
+        if name:
+            current_set.add(name)
+    authorized_treatments_var.set(current_set)
+    print(f"[authorized treatments] Updated: {current_set}")
 
     results = [doc.page_content.strip() for doc in docs]
     # return "\n\n---\n\n".join(results)
@@ -61,51 +185,6 @@ def search_clinics_by_keyword(symptom: str) -> str:
         "建議您可以與本診所的專業醫師或諮詢師進一步討論，"
         "我也可以協助您預約本診所的療程喔！"
     )   
-
-
-# @tool
-# def search_clinics_info(question: str) -> str:
-#     """
-#     根據用戶問診所資訊（地址、電話、療程初診費用），
-#     若偵測到使用者在問費用、體驗價或初診，需先確認療程項目再回答。
-#     """
-#     print(f"Original question: {question}")
-
-#     # ✅ Step 1. 嘗試從 question 偵測療程名稱
-#     treatments = ["Emface", "腦波機", "紅光", "無限電波", "NightLase", "止鼾", "EECP", "DeepTMS"]
-#     detected_treatment = None
-#     for t in treatments:
-#         if t.lower() in question.lower():
-#             detected_treatment = t
-#             break
-
-#     # ✅ Step 2. 若沒有提到療程名稱，嘗試用 LLM 或上文的 context 來補
-#     # （這裡示範簡單版本：若沒偵測到，請 AI 直接詢問使用者）
-#     if not detected_treatment:
-#         print("未偵測到療程名稱，詢問使用者或上文補足。")
-#         return "請問您想了解哪個療程的初診費用呢？（例如：Emface、腦波機、紅光）"
-
-#     # ✅ Step 3. 重寫 question（在前面補上療程名稱）
-#     full_question = f"{detected_treatment} 初診費 {question}"
-#     print(f"Info tool called with: {full_question}")
-
-#     # ✅ Step 4. 呼叫 retriever
-#     # docs = qa_retriever.get_relevant_documents(full_question)
-#     docs = qa_retriever(full_question)
-#     print('related_docs:', docs)
-
-#     if not docs:
-#         return f"抱歉，我找不到「{question}」的資訊。"
-
-#     # 只回傳答案，不加 AI 生成
-#     content = docs[0].page_content
-#     if "答案：" in content:
-#         answer = content.split("答案：", 1)[1].split("\n")[0].strip()
-#     else:
-#         answer = content.strip()
-
-#     # return answer
-#     return docs[0].page_content
 
 
 @tool
@@ -123,35 +202,42 @@ def search_clinics_info(treatment_name: str, category: str = "費用") -> str:
     - category: 查詢類別 (費用, 地址, 電話)
     """
     print(f"Target Treatment: {treatment_name}, Category: {category}")
-    boosted_query = f"{treatment_name} {treatment_name} {treatment_name} {category}"
+
+    # 初診 / 諮詢 → 走 consult_plan.csv 結構化查表（免費/收費是明確欄位，不用語意檢索）
+    if "初診" in category or "諮詢" in category:
+        consult = get_consult_info(treatment_name, TREATMENT_SYNONYMS)
+        if consult:
+            return consult
+        print(f"[consult] 無對應，fallback 回 qa_retriever：{treatment_name}")
+
+    # 地址 / 交通 / 電話 / 看診時間 / 停車 → 直接回「診所地點」那筆，不賭模糊檢索排名
+    if any(k in category for k in CLINIC_INFO_INTENT):
+        if CLINIC_BASIC_INFO:
+            print(f"[clinic_info] category='{category}' 命中診所資訊意圖 → 直接回傳")
+            return CLINIC_BASIC_INFO
+        print("[clinic_info] 缺診所基本資訊，fallback 回 qa_retriever")
+
+    boosted_query = f"{category} {category} {category}"
     print(f"Boosted Query: {boosted_query}")
 
 
     # --- Step 2. 呼叫 retriever ---
     docs = qa_retriever.get_relevant_documents(boosted_query)
     if not docs:
+        print(f"[qa] 檢索無結果：{boosted_query}")
         return f"抱歉，我找不到「{boosted_query}」的資訊。"
+
+    # --- 觀測：印出檢索到的前幾筆（排序、類別、內容開頭）---
+    print(f"[qa] 檢索「{boosted_query}」回傳 {len(docs)} 筆：")
+    for i, d in enumerate(docs):
+        cat = d.metadata.get("category", "?")
+        head = d.page_content.replace("\n", " ")[:80]
+        print(f"  [{i}] category={cat} | {head}")
 
     # --- Step 3. 只回傳答案 ---
     content = docs[0].page_content
+    print(f"[qa] 採用 [0] 回傳，長度 {len(content)}")
     return content
-    # print(f"Original question: {question}")
-
-    # --- Step 1. 偵測是否是費用相關問題 ---
-    # fee_keywords = ["費用", "初診", "體驗價"]
-    # if any(kw in question for kw in fee_keywords):
-    #     treatments = ["Emface", "腦波機", "紅光", "無限電波", "NightLase", "止鼾", "EECP", "DeepTMS", "EMBODY", "NEO"]
-    #     detected_treatment = None
-    #     for t in treatments:
-    #         if t.lower() in question.lower():
-    #             detected_treatment = t
-    #             break
-    #     # 拼接完整問題
-    #     full_question = f"{detected_treatment} 初診費 {question}"
-    #     print(f"Info tool called with: {full_question}")
-    # else:
-    #     full_question = question
-
 
 
 
@@ -202,275 +288,4 @@ def get_empathy_questions_by_symptom(symptom_tag: str) -> dict:
         "empathy": "謝謝您的分享，我非常理解您的困擾。",
         "questions": ["能再幫我多描述一下目前的狀況嗎？"]
     })
-# 假設你有一份事先整理好的字典
-    # symptom_map = {
-    #     "失眠": {
-    #         "empathy": "睡不好真的很辛苦，影響整天的精神狀態。",
-    #         "questions": [
-    #             "想先了解一下，您比較常遇到的狀況是哪一種呢？\n1️⃣ 入睡困難\n2️⃣ 睡不安穩、容易醒\n3️⃣ 半夜驚醒或打呼、呼吸中斷",
-    #             "平常這些狀況大概持續多久了呢？"
-    #         ]
-    #     },
-    #     "痘痘": {
-    #         "empathy": "痘痘冒出來一定很困擾，尤其會影響心情與自信。",
-    #         "questions": [
-    #             "目前痘痘大多是集中在哪些部位？",
-    #             "最近有特別熬夜、壓力大或飲食改變嗎？",
-    #             "你有嘗試使用藥膏或保養品處理嗎？"
-    #         ]
-    #     },
-    #     "皺紋類": {
-    #         "keywords": ["皺紋", "法令紋", "木偶紋"],
-    #         "empathy": "皺紋的形成通常和膠原蛋白流失、表情肌活動或生活作息有關，很多人都會在意這部分的變化～別擔心，我們可以一起看看有哪些療程能幫助肌膚恢復緊緻與彈性。",
-    #         "general_questions":[
-    #             "想請問您皺紋主要集中在哪些部位呢？例如眼周、法令紋或額頭？",
-    #             "這些皺紋是靜態的（平常就明顯）還是表情時才比較明顯呢？",
-    #             "過去有嘗試過玻尿酸、肉毒或音波拉提等相關療程嗎？"
-    #         ],
-    #         "specific_questions": [
-    #             "您提到的是{}，想了解它是靜態的還是表情時才會比較明顯呢？",
-    #             "過去有嘗試過玻尿酸、肉毒或音波拉提等相關療程嗎？"
-    #         ]
-    #     },
-    #     "胖": {
-    #         "empathy": "讓我們來協助你。體重問題常讓人焦慮，但你願意聊已經是很好的開始。",
-    #         "questions": [
-    #             "平時有在運動嗎？",
-    #             "飲食有特別控制嗎？"
-    #         ]
-    #     },
-    #     "減脂": {
-    #         "empathy": "讓我們來協助你。體重問題常讓人焦慮，但你願意聊已經是很好的開始。",
-    #         "questions": [
-    #             "請問本身有比較偏向哪些類型？\n1️. 無法控制飲食\n2️. 缺乏運動族群\n3️. 產後媽媽族群]\n4. 生活作息不規律\n5. 基因遺傳家族史\n6. 年紀漸長代謝下降 ",
-    #             "有接觸過療程的經驗嗎？或是實際諮詢檢測評估過狀況呢？"
-    #         ]
-    #     },
-    #     "打呼":{
-    #         "empathy": "睡覺打呼不僅影響自己，也可能影響身邊的人。",
-    #         "questions": [
-    #             "之前有看過甚麼門診治療嗎？",
-    #             "平時有側睡習慣嗎？"
-    #         ]
-    #     }
-    #     # 其他症狀……
-    # }
-
-    # for category, data in symptom_map.items():
-    #     for keyword in data["keywords"]:
-    #         if keyword in symptom:
-    #             empathy = data["empathy"]
-
-    #             # 根據具體程度分流
-    #             if symptom == "皺紋":
-    #                 # 模糊症狀 → 問範圍
-    #                 return {
-    #                     "empathy": empathy,
-    #                     "questions": data["general_questions"]
-    #                 }
-    #             else:
-    #                 # 具體症狀 → 問狀況/需求
-    #                 specific_qs = [q.format(symptom) if "{}" in q else q for q in data["specific_questions"]]
-    #                 return {
-    #                     "empathy": empathy,
-    #                     "questions": specific_qs
-    #                 }
-        
-    
-    # fallbacks = [
-    #     {
-    #         "empathy": "我懂，這樣的狀況一定不好受。",
-    #         "questions": ["方便多分享一些細節嗎？"]
-    #     },
-    #     {
-    #         "empathy": "聽起來真的讓人困擾。",
-    #         "questions": ["想請問大多是在什麼情況下發生呢？"]
-    #     },
-    #     {
-    #         "empathy": "謝謝你願意分享。",
-    #         "questions": ["能再說說具體的感受或影響嗎？"]
-    #     }
-    # ]
-    # return random.choice(fallbacks)
-
-    # return {
-    #     "empathy": "我了解你目前的困擾。",
-    #     "questions": ["可以再多說一點你的狀況嗎？"]
-    # }
-
-
-# @tool
-# def check_availability(desired_date:DateModel, treatment_name:Literal['EECP', '腦波機', 'SIS', 'Emface', '蜂巢皮秒', 'Embody', 'NEO']) -> str:
-#     """
-#     查詢資料庫裡面是否有可以預約療程的時間。
-
-#     參數：
-#     desired_date (DateModel): 要查詢的日期和時間，格式為 "MM-DD-YYYY"。如果不提供，則查詢當天有空缺的時間。
-#     treatment_name: 要查詢的療程名稱。
-
-#     返回:
-#     str: 可以預約的日期和時間。
-#     """
-#     print("Tool check availability")
-
-#     base_dir = os.path.dirname(__file__)
-#     parent_dir = os.path.dirname(base_dir)
-#     csv_path = os.path.join(parent_dir, "data", "treatment_availability.csv")
-#     df = pd.read_csv(csv_path, encoding="big5")    
-#     df['date_slot_time'] = df['date_slot'].apply(lambda input: input.split(' ')[-1])
-    
-#     # print('desirteddddd', desired_date.date)
-#     desired_day = desired_date.date
-#     print('desired_day:', desired_day)
-
-#     rows = list(
-#         df[
-#             (df['date_slot'].apply(lambda input: input.split(' ')[0]) == desired_day) &
-#             (df['treatment'] == treatment_name) &
-#             (df['is_available'] == True)
-#         ]['date_slot_time']
-#     )
-#     print('rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr', rows)
-#     if len(rows) == 0:
-#         output = "一整天的預約都滿囉"
-#     else:
-#         output = f'可預約的日期 {desired_date.date}\n'
-#         output += "可預約的時間: " + ', '.join(rows)
-
-#     return output
-# @tool
-# def check_availability_by_specialization(desired_date:DateModel, specialization:Literal['EECP', '腦波機', 'SIS', 'Emface', '蜂巢皮秒', 'Embody', 'NEO']):
-#     """
-#     Checking the database if we have availability for the specific specialization.
-#     The parameters should be mentioned by the user in the query
-#     """
-#     print("Tool check availability by specialization")
-
-#     #Dummy data
-#     base_dir = os.path.dirname(__file__)
-#     parent_dir = os.path.dirname(base_dir)
-#     csv_path = os.path.join(parent_dir, "data", "treatment_availability.csv")
-    
-#     df = pd.read_csv(csv_path, encoding="big5")
-#     df['date_slot_time'] = df['date_slot'].apply(lambda input: input.split(' ')[-1])
-#     rows = df[(df['date_slot'].apply(lambda input: input.split(' ')[0]) == desired_date.date) & (df['specialization'] == specialization) & (df['is_available'] == True)].groupby(['specialization', 'treatment'])['date_slot_time'].apply(list).reset_index(name='available_slots')
-
-#     if len(rows) == 0:
-#         output = "一整天的預約都滿囉"
-#     else:
-#         def convert_to_am_pm(time_str):
-#             # Split the time string into hours and minutes
-#             time_str = str(time_str)
-#             hours, minutes = map(int, time_str.split(":"))
-            
-#             # Determine AM or PM
-#             period = "AM" if hours < 12 else "PM"
-            
-#             # Convert hours to 12-hour format
-#             hours = hours % 12 or 12
-            
-#             # Format the output
-#             return f"{hours}:{minutes:02d} {period}"
-#         output = f'This availability for {desired_date.date}\n'
-#         for row in rows.values:
-#             output += row[1] + ". Available slots: \n" + ', \n'.join([convert_to_am_pm(value)for value in row[2]])+'\n'
-
-#     return output
-# @tool
-# def set_appointment(desired_date:DateTimeModel, id_number:IdentificationNumberModel, treatment_name:Literal['EECP', '腦波機', 'SIS', 'Emface', '蜂巢皮秒', 'Embody', 'NEO']) -> str:
-#     """
-#     幫客人預約療程。
-
-#     參數：
-#     desired_date (DateModel): 想要預約的日期和時間，格式為 "MM-DD-YYYY"。如果不提供，則查詢當天有空缺的時間。
-#     id_number: 客人手機號碼
-#     treatment_name: 要預約的療程名稱。
-
-#     返回:
-#     str: 預約成功的日期和時間。
-#     """
-#     print("set appointment")
-#     try:
-#         base_dir = os.path.dirname(__file__)
-#         parent_dir = os.path.dirname(base_dir)
-#         csv_path = os.path.join(parent_dir, "data", "treatment_availability.csv")
-        
-#         df = pd.read_csv(csv_path, encoding="big5")
-#     except ValueError as ve:
-#         print(f"pydantic 驗證錯誤: {ve}")
-#     except Exception as e:
-#         print(f"其他錯誤: {e}")
-   
-#     from datetime import datetime
-#     def convert_datetime_format(dt_str):
-#         dt = datetime.strptime(dt_str, "%m-%d-%Y %H:%M")
-#         return dt.strftime("%m-%d-%Y %H:%M")
-
-#     converted_date = convert_datetime_format(desired_date.date)
-#     case = df[
-#         (df['date_slot'] == converted_date) &
-#         (df['treatment'] == treatment_name) &
-#         (df['is_available'] == True)
-#     ]
-
-#     if len(case) == 0:
-#         return "這個預約時段已滿喔"
-#     else:
-#         idx = df[
-#             (df['date_slot'] == converted_date) &
-#             (df['treatment'] == treatment_name) &
-#             (df['is_available'] == True)
-#         ].index
-
-#         df.loc[idx, 'is_available'] = False
-#         df.loc[idx, 'patient_to_attend'] = id_number.id
-
-#         output_path = os.path.join(parent_dir, "data", "availability.csv")
-#         df.to_csv(output_path, index=False, encoding="big5")
-
-#         return f"預約成功！{treatment_name} 已預約在 {converted_date}"
-# @tool
-# def cancel_appointment(date:DateTimeModel, id_number:IdentificationNumberModel, treatment_name:Literal['EECP', '腦波機', 'SIS', 'Emface', '蜂巢皮秒', 'Embody', 'NEO']):
-#     """
-#     Canceling an appointment.
-#     The parameters MUST be mentioned by the user in the query.
-#     """
-#     print("cancel appointment")
-
-#     base_dir = os.path.dirname(__file__)
-#     parent_dir = os.path.dirname(base_dir)
-#     csv_path = os.path.join(parent_dir, "data", "treatment_availability.csv")
-    
-#     df = pd.read_csv(csv_path, encoding="big5")
-#     case_to_remove = df[(df['date_slot'] == date.date)&(df['patient_to_attend'] == id_number.id)&(df['treatment'] == treatment_name)]
-#     if len(case_to_remove) == 0:
-#         return "You don´t have any appointment with that specifications"
-#     else:
-#         df.loc[(df['date_slot'] == date.date) & (df['patient_to_attend'] == id_number.id) & (df['treatment'] == treatment_name), ['is_available', 'patient_to_attend']] = [True, None]
-#         df.to_csv(f'availability.csv', index = False)
-
-#         return "Successfully cancelled"
-# @tool
-# def reschedule_appointment(old_date:DateTimeModel, new_date:DateTimeModel, id_number:IdentificationNumberModel, treatment_name:Literal['EECP', '腦波機', 'SIS', 'Emface', '蜂巢皮秒', 'Embody', 'NEO']):
-#     """
-#     Rescheduling an appointment.
-#     The parameters MUST be mentioned by the user in the query.
-#     """
-#     print("reschedule appointment")
-
-#     #Dummy data
-#     base_dir = os.path.dirname(__file__)
-#     parent_dir = os.path.dirname(base_dir)
-#     csv_path = os.path.join(parent_dir, "data", "treatment_availability.csv")
-
-#     df = pd.read_csv(csv_path, encoding="big5")
-#     available_for_desired_date = df[(df['date_slot'] == new_date.date)&(df['is_available'] == True)&(df['treatment'] == treatment_name)]
-#     if len(available_for_desired_date) == 0:
-#         return "Not available slots in the desired period"
-#     else:
-#         cancel_appointment.invoke({'date':old_date, 'id_number':id_number, 'treatment':treatment_name})
-#         set_appointment.invoke({'desired_date':new_date, 'id_number': id_number, 'treatment': treatment_name})
-#         return "Successfully rescheduled for the desired time"
-    
-
 

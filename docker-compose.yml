@@ -1,0 +1,19 @@
+version: '3.9'
+
+services:
+  ai-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fb-clinics-agent:latest
+    container_name: fb-clinics-agent
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    env_file:
+      - .env                     # runtime 才注入 .env（不會包進 image）
+    # 如果之後想讓療程資料可獨立更新（不重 build），把下面 mount 打開：
+    # volumes:
+    #   - ./data:/app/data
+    #   - ./chroma_token_split:/app/chroma_token_split
+    #   - ./chroma_qa:/app/chroma_qa
