@@ -1,22 +1,56 @@
-import pandas as pd
 from typing import Literal, Dict, Any
 from contextvars import ContextVar
 from langchain_core.tools import tool
 from data_models.models import DateModel, DateTimeModel, IdentificationNumberModel
 import os
+import csv
 from utils.ensemble_retriever import get_ensemble_retriever
 from utils.qa_retriever import get_qa_retriever
 from utils.consult_plan import get_consult_info
 import random
 
 print("toolkits.py is running")
-qa_retriever = get_qa_retriever()
+# 兩份獨立 QA 索引（共用 builder、各自快取，避免交叉污染）：
+#   clinic_qa     → 診所交易/層級問答（地址、付款、預約流程、保險…），由 booking_node 的 search_clinics_info 使用
+#   treatment_qa  → 療程內容問答（效果、修復期、會不會痛…，category=療程名），由 information_node 使用
+clinic_qa_retriever = get_qa_retriever(
+    "data/clinics_qa.csv", "./chroma_clinic_qa", "./bm25_clinic_qa.pkl")
+treatment_qa_retriever = get_qa_retriever(
+    "data/treatment_qa.csv", "./chroma_treatment_qa", "./bm25_treatment_qa.pkl", k=6)
 ensemble_retriever = get_ensemble_retriever()
 
 # 每個 request 範圍的「合法療程」集合
 # search_clinics_by_keyword 被呼叫時會把 retriever 回的療程名加進來
 # 由 backend_agent_service 在 request 開始時 reset、結束時讀取
 authorized_treatments_var: ContextVar = ContextVar("authorized_treatments", default=None)
+
+# 每個 request 範圍的「事實來源」集合：本輪所有 retriever 撈到的原始內容（療程介紹、療程問答…）。
+# sanitize 用它做 faithfulness 核對——AI 回覆裡關於療程的事實（名稱、英文全名、技術原理、
+# 數據、機器/品牌名）必須能在這些內容裡找到依據，找不到的就視為編造、要依資料重講。
+# 由 backend_agent_service 在 request 開始時 reset。
+grounded_content_var: ContextVar = ContextVar("grounded_content", default=None)
+
+# 每個 request 範圍的「療程費用表」：後端把整張表原封不動存進來（不預先 filter），
+# 由 get_treatment_fee 工具在 booking 認出療程的當下才 filter——用 booking 的可靠解析，
+# 取代原本 graph 前那個弱解析的預注入（會對代名詞/序數失敗、導致 AI 沒價可用而編價）。
+treatment_fees_var: ContextVar = ContextVar("treatment_fees", default=None)
+
+
+def register_grounded_content(text: str) -> None:
+    """
+    把本輪 retriever 撈到的原始內容登錄為「事實來源」，供 sanitize 的 faithfulness 核對。
+
+    ⚠️ 與 authorized_treatments_var 同樣的理由：必須**原地 mutate 同一個 set 物件**，
+    不可換新物件再 set 回去——node 可能跑在 copy_context 裡，在 copy 內重建物件不會傳回
+    父 context，但原地 .add() 因共用同一參照，父 context（sanitize）讀得到。
+    """
+    if not text or not str(text).strip():
+        return
+    cur = grounded_content_var.get()
+    if cur is None:
+        cur = set()
+    cur.add(str(text).strip())
+    grounded_content_var.set(cur)
 
 # 療程同義詞 / 別名群組：每一組代表「同一個療程」的不同講法（正規名、學名、英文、暱稱）
 # 用途：sanitize 檢查時，只要某一組裡有「正規名」這輪真的被 retriever 撈到（出現在
@@ -42,34 +76,130 @@ TREATMENT_SYNONYMS: list = [
 ]
 
 
-# 診所基本資訊（地址 / 交通 / 看診時間 / 電話 / 停車）全擠在 clinics_qa「診所地點」那一筆。
-# 短查詢（「地址」「怎麼去」）用模糊檢索常被別的 row 插隊甚至撈不到，
-# 所以這類意圖直接回傳該筆，不賭向量 / BM25 排名。模組載入時抓一次。
-def _load_clinic_basic_info():
+@tool
+def get_treatment_fee(treatment_name: str) -> str:
+    """查詢某療程的「體驗價」（療程單次 / 組合方案的體驗價格）。
+
+    參數:
+    - treatment_name: 療程名稱（例如: Emface, NEO, 冷凍減脂, 瘦瘦筆, SIS…）。
+      **必須帶明確療程名**，不可傳空字串、「費用」、「體驗價」這類非療程名。
+
+    回傳該療程在費用表裡的所有體驗價方案（單做 + 組合都會列出）；查無方案時明確告知。
+    ⚠️ 只查「體驗價」；初診 / 諮詢費請改用 search_clinics_info(treatment_name, "初診")。
+    """
+    fees = treatment_fees_var.get() or []
+    name = (treatment_name or "").strip()
+    if not name or name in ("費用", "體驗價", "價格", "初診"):
+        return "（未指定明確療程，無法查體驗價。請先確認客人問的是哪個療程，再帶療程名查詢。）"
+
+    # 用別名群組擴充比對詞（Emface↔菲斯波、NEO↔熱磁減脂…），對 fee name 做子字串比對
+    keywords = {name}
+    low = name.lower()
+    for group in TREATMENT_SYNONYMS:
+        if any(a.lower() in low or low in a.lower() for a in group):
+            keywords |= set(group)
+            break
+
+    matched = [
+        f for f in fees
+        if any(k.lower() in (getattr(f, "name", "") or "").lower() for k in keywords)
+    ]
+    if not matched:
+        return (
+            f"[體驗價] {name} 目前在費用表裡沒有對應的體驗價方案。\n"
+            f"請回覆客人「目前 {name} 沒有提供體驗價方案，可以先預約諮詢評估，由專人為您安排」，"
+            f"**嚴禁**自己編造價格，也**嚴禁**拿其他療程的價格套用。"
+        )
+
+    lines = [
+        f"- {getattr(f, 'name', '')}：NT$ {getattr(f, 'price', 0):,}"
+        + ("（組合方案，整套價）" if "+" in (getattr(f, "name", "") or "") else "（單做價）")
+        for f in matched
+    ]
+    has_combo = any("+" in (getattr(f, "name", "") or "") for f in matched)
+    combo_guard = (
+        "\n🚨 組合方案：標「組合方案」的那幾行是**整套一起做**的總價，"
+        "嚴禁拆成單一療程 / 單一部位的價格，只能照完整方案名原樣報價。"
+    ) if has_combo else ""
+
+    content = "[體驗價] 以下是該療程的體驗價方案：\n" + "\n".join(lines) + combo_guard
+    # 體驗價來自費用表（確定性來源）→ 登錄成 grounding，讓 moderator 事實核對認得它是依據
+    register_grounded_content(content)
+    print(f"[get_treatment_fee] {name!r} → 命中 {len(matched)} 筆體驗價")
+    return content
+
+
+# 診所基本資訊（地址 / 停車 / 看診時間 / 電話）已改為「分店別」多筆存在 clinics_qa，
+# 由 search_clinics_info 依 category（如「台北停車」「竹北地址」）檢索對應分店那筆，
+# 不再走單店短路。原 _load_clinic_basic_info / CLINIC_BASIC_INFO / CLINIC_INFO_INTENT 已移除。
+
+# 分店靜態資訊查表：category（「台北交通」「竹北交通」「台北停車」「竹北停車」…）→ 乾淨答案文字。
+# 供 booking 對「地址 / 停車 / 看診時間 / 電話」原文直出，讓地址文字 100% 來自 CSV、不經 LLM 生成，
+# 徹底杜絕地址幻覺（模組載入時抓一次，直讀 CSV 不走模糊檢索，確保撈到正確分店那筆）。
+def _load_clinic_info_rows() -> dict:
+    table = {}
     try:
-        df = pd.read_csv("data/clinics_qa.csv", encoding="utf-8-sig")
+        with open("data/clinics_qa.csv", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                cat = (row.get("category") or "").strip()
+                ans = (row.get("answer") or "").strip()
+                if cat and ans and cat not in table:
+                    table[cat] = ans
     except Exception as e:
-        print(f"[clinic_info] 載入 clinics_qa.csv 失敗：{e}")
+        print(f"[clinic_info] 載入分店靜態資訊失敗：{e}")
+    return table
+
+
+CLINIC_INFO_ROWS: dict = _load_clinic_info_rows()
+print(f"[clinic_info] 分店靜態資訊查表已載入 {len(CLINIC_INFO_ROWS)} 筆 category")
+
+
+# 療程介紹「原文直出」：療程名 → clinics_introductions3.csv 的 introduction 原文（big5）。
+# 供 information_node 對「單一指名療程的介紹請求」一字不改直出，杜絕 AI 自編英文全名/縮寫/原理。
+def _load_treatment_intro_rows() -> dict:
+    table = {}
+    try:
+        with open("data/clinics_introductions3.csv", encoding="big5", newline="") as f:
+            for row in csv.DictReader(f):
+                name = (row.get("name") or "").strip()
+                intro = (row.get("introduction") or "").strip()
+                if name and intro and name not in table:
+                    table[name] = intro
+    except Exception as e:
+        print(f"[treatment_intro] 載入療程介紹失敗：{e}")
+    return table
+
+
+TREATMENT_INTRO_ROWS: dict = _load_treatment_intro_rows()
+print(f"[treatment_intro] 療程介紹原文已載入 {len(TREATMENT_INTRO_ROWS)} 筆")
+
+
+def get_treatment_intro(treatment_name: str):
+    """回傳某療程的 CSV 原文介紹；用 TREATMENT_SYNONYMS 對應別名，找不到回 None。"""
+    name = (treatment_name or "").strip()
+    if not name:
         return None
-    for _, row in df.iterrows():
-        q = str(row.get("question", "")).strip()
-        cat = str(row.get("category", "")).strip()
-        if q == "診所地點" or cat == "交通":
-            return str(row.get("answer", "")).strip()
-    print("[clinic_info] 找不到『診所地點』那筆（question=診所地點 / category=交通）")
+    # 1) 直接（不分大小寫）命中 CSV name
+    for k, v in TREATMENT_INTRO_ROWS.items():
+        if k.lower() == name.lower():
+            return v
+    # 2) 別名群組對應（Emface↔菲斯波、SIS↔Sis…）
+    low = name.lower()
+    target = None
+    for group in TREATMENT_SYNONYMS:
+        if any(a.lower() in low or low in a.lower() for a in group):
+            target = group
+            break
+    if target:
+        for k, v in TREATMENT_INTRO_ROWS.items():
+            kl = k.lower()
+            if any(a.lower() in kl or kl in a.lower() for a in target):
+                return v
+    # 3) 寬鬆子字串
+    for k, v in TREATMENT_INTRO_ROWS.items():
+        if name in k or k in name:
+            return v
     return None
-
-
-CLINIC_BASIC_INFO = _load_clinic_basic_info()
-print(f"[clinic_info] 診所基本資訊 {'已載入' if CLINIC_BASIC_INFO else '缺失'}")
-
-# 命中以下任一意圖（出現在 agent 傳進來的 category）→ 直接回診所基本資訊那筆
-CLINIC_INFO_INTENT = (
-    "地址", "地點", "位置", "交通", "在哪", "在那",
-    "怎麼去", "怎麼走", "怎麼到", "怎麼抵達", "搭車", "搭乘",
-    "公車", "捷運", "開車", "停車", "電話", "聯絡",
-    "看診", "營業", "幾點", "到達", "可以到嗎"
-)
 
 
 # 防呆用：症狀「分類標籤」→ 療程資料庫裡真實會出現的症狀詞。
@@ -162,6 +292,11 @@ def search_clinics_by_keyword(symptom: str) -> str:
         return f"目前找不到與「{symptom}」相關的療程。"
 
     # 把這次 retriever 撈到的療程名收進 ContextVar（給後處理檢查用）
+    # ⚠️ 必須「原地 mutate」這個 set，不可換成新物件再 set 回去。
+    #    backend_agent_service 在 request 開始時先 set 一個空 set，graph 的 node 可能跑在
+    #    copy_context 裡——在 copy 裡做的 .set() 不會傳回父 context，但原地 .add() 因為共用
+    #    同一個物件參照，父 context（sanitize_ai_response）讀得到。改成 `set(old | new)` 之類
+    #    建新物件的寫法會斷鏈，導致幻覺檢查靜默失效。
     current_set = authorized_treatments_var.get()
     if current_set is None:
         current_set = set()
@@ -174,9 +309,12 @@ def search_clinics_by_keyword(symptom: str) -> str:
 
     results = [doc.page_content.strip() for doc in docs]
     # return "\n\n---\n\n".join(results)
-    
+
     # ✅ 正確拼接成單一字串
     combined_results = "\n\n---\n\n".join(results)
+
+    # 把療程介紹原始內容登錄為事實來源，供 sanitize faithfulness 核對（機器/品牌/技術名都在這裡）
+    register_grounded_content(combined_results)
 
     # ✅ 加上統一結尾
     return (
@@ -198,7 +336,7 @@ def search_clinics_info(treatment_name: str, category: str = "費用") -> str:
     """
     查詢診所特定療程的資訊。
     參數:
-    - treatment_name: 療程名稱 (例如: 瘦瘦筆, EMBODY, NEO, Emface)
+    - treatment_name: 療程名稱 (例如: 瘦瘦筆, EMBODY, NEO, Emface, 冷凍減脂, 腦波機, SIS)
     - category: 查詢類別 (費用, 地址, 電話)
     """
     print(f"Target Treatment: {treatment_name}, Category: {category}")
@@ -207,22 +345,23 @@ def search_clinics_info(treatment_name: str, category: str = "費用") -> str:
     if "初診" in category or "諮詢" in category:
         consult = get_consult_info(treatment_name, TREATMENT_SYNONYMS)
         if consult:
+            # 初診/諮詢內容來自 consult_plan 查表（確定性來源）→ 登錄成 grounding，
+            # 否則 moderator 事實核對會因為在檢索內容裡找不到依據而把它當幻覺砍掉。
+            register_grounded_content(consult)
             return consult
         print(f"[consult] 無對應，fallback 回 qa_retriever：{treatment_name}")
 
-    # 地址 / 交通 / 電話 / 看診時間 / 停車 → 直接回「診所地點」那筆，不賭模糊檢索排名
-    if any(k in category for k in CLINIC_INFO_INTENT):
-        if CLINIC_BASIC_INFO:
-            print(f"[clinic_info] category='{category}' 命中診所資訊意圖 → 直接回傳")
-            return CLINIC_BASIC_INFO
-        print("[clinic_info] 缺診所基本資訊，fallback 回 qa_retriever")
-
+    # 診所有兩間分店（台北信義店 / 竹北店），地址 / 停車 / 看診時間 / 電話都各自一筆，
+    # 因此不再走「單一診所」短路，一律用 category（booking 會帶「台北停車」「竹北地址」等分店主題詞）
+    # 去檢索 clinic_qa，撈出對應分店那筆。
+    # 走到這裡 = 診所交易/層級問答（地址、停車、付款、預約流程、保險…），用 category 主題詞檢索 clinic_qa。
+    # 療程內容問答（效果/修復期/會不會痛）已改由 information_node 走 treatment_qa，不在此處理。
     boosted_query = f"{category} {category} {category}"
     print(f"Boosted Query: {boosted_query}")
 
 
     # --- Step 2. 呼叫 retriever ---
-    docs = qa_retriever.get_relevant_documents(boosted_query)
+    docs = clinic_qa_retriever.get_relevant_documents(boosted_query)
     if not docs:
         print(f"[qa] 檢索無結果：{boosted_query}")
         return f"抱歉，我找不到「{boosted_query}」的資訊。"
@@ -237,6 +376,7 @@ def search_clinics_info(treatment_name: str, category: str = "費用") -> str:
     # --- Step 3. 只回傳答案 ---
     content = docs[0].page_content
     print(f"[qa] 採用 [0] 回傳，長度 {len(content)}")
+    register_grounded_content(content)
     return content
 
 
@@ -254,29 +394,22 @@ def get_empathy_questions_by_symptom(symptom_tag: str) -> dict:
 
     symptom_map = {
         "皺紋類": {
-            "empathy": "我很理解您對細紋或紋路的在意，這確實是許多人追求自信時最關注的細節。",
-            "questions": ["過去有嘗試過相關的緊緻療程嗎？", "主要集中在哪一個部位？"]
+            "empathy": """老化不是單純皮膚問題，底層的肌肉也在慢慢「無力」，才是臉型往下走的真正原因喔。
+                        我們這邊特別的地方是從最底層的結構「肌肉層 + 筋膜層 + 真皮層」這三個層次同時處理，讓效果更全面更持久✨
+                        歡迎與我們聊聊💬了解您的需求～""",
+            "questions": ["過去有嘗試過相關的療程嗎？", "請問目前年齡大約在哪個區間呢？ 想加強或改善哪些臉部狀況呢？"]
         },
         "私密療程": {
             "empathy": "私密處的保養與健康確實非常重要，謝謝您願意信任並與我分享。 ",
             "questions": ["您主要是想了解功能改善，還是日常的美觀保養呢？"]
         },
         "睡眠與神經": {
-            "empathy": "長期睡不好或壓力大對身心負擔真的很高，我們會陪您一起找回舒適的休息品質。",
-            "questions": ["""方便進一步了解，請問目前有出現以下這些狀況嗎？/n
-                          1️⃣  睡不好、淺眠易醒、入睡困難/n2️⃣  睡覺會打呼、有呼吸中止情況/n
-                            3️⃣  長期依賴藥物，副作用明顯/n
-                            4️⃣  情緒緊繃、緊張焦慮不安/n
-                            5️⃣  心跳偏快、容易胸悶心悸/n
-                            6️⃣  記憶力下降、注意力變差/n
-                            7️⃣  頭痛、頭暈、耳鳴常發作/n
-                            8️⃣  胃食道逆流、脹氣、消化不良/n
-                            9️⃣  經常累沒精神、莫名身體痠痛""",
-                        "這種狀況持續多久了？會想了解如何透過腦波偵測來找出原因嗎？"]
+            "empathy": '很多人睡不好、失眠？但其實背後常伴隨壓力、緊繃、焦慮甚至心悸的狀況，更常見的是不舒服很久，卻一直找不到原因！\n\n我們結合複合式非侵入治療與現代 AI 智能數據檢測，累積萬筆治療成功案例，讓治療有依據更安心💕',
+            "questions": ['方便進一步了解，請問目前有出現以下這些狀況嗎？\n1. 睡不好、淺眠易醒、入睡困難\n2. 睡覺會打呼、有呼吸中止情況\n3. 長期依賴藥物，副作用明顯\n4. 情緒緊繃、緊張焦慮不安\n5. 心跳偏快、容易胸悶心悸\n6. 記憶力下降、注意力變差\n7. 頭痛、頭暈、耳鳴常發作\n8. 胃食道逆流、脹氣、消化不良\n9. 經常累沒精神、莫名身體痠痛\n\n（只需回數字即可，方便快速回覆唷）']
         },
         "體態管理": {
-            "empathy": "體態調整需要耐心與科學方法，願意開始了解就是很棒的第一步。",
-            "questions": ["了解您的情況了。為了更精確建議，請問您目前是偏向飲食習慣、運動缺乏，還是代謝問題比較困擾您呢？"]
+            "empathy": '有產生這些問題，往往不是單一因素造成的唷！\n\n我們不只幫您解決單一問題，而是從源頭出發進行整合性的調整，由內到外讓您美麗與健康同時兼具，幫助您維持更長久的良好狀態。',
+            "questions": ['歡迎和我們聊聊，好讓我們了解一下您的狀況唷\n1.【體重嚴重卡關 / 瘦不下來】\n2.【嘗試減肥失敗 / 容易復胖】\n3.【作息睡眠品質 / 情緒壓力】\n4.【飲食難以控制／暴飲暴食】\n5.【長期久站久坐／缺乏運動】\n6.【產後無法維持／身材走樣】\n7.【代謝逐漸下降／年紀漸長】\n\n（只需回數字即可，方便快速回覆唷）']
         },
         "皮膚其他": {
             "empathy": "皮膚出現痘痘或斑點確實讓人困擾，我們會協助您找回肌膚的健康狀態。",

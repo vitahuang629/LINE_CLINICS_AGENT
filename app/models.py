@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Any, Dict
 
 # --------- 資料模型 (原 /execute 用) ---------
 class ChatMessage(BaseModel):
@@ -33,3 +33,4 @@ class BackendResponse(BaseModel):
     text: str               # 回覆文字（CallCS=1 時為空字串）
     images: List[str] = []  # 圖片 URL 列表（CallCS=1 或 2 時為空 list）
     CallCS: int = 0         # 0 = 正常 / 1 = 客人找真人客服（無 text、無 images）/ 2 = 預約流程（有 text、無 images，後端先發 text 再通知客服）
+    trace: Optional[Dict[str, Any]] = None  # LLM-as-judge 評估用的內部軌跡（草稿/grounding/moderator 判定…），後端存起來當 eval dataset；後端未接前可忽略

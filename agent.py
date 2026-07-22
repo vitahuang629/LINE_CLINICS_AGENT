@@ -6,12 +6,14 @@ from typing_extensions import TypedDict, Annotated
 from langchain_core.prompts.chat import ChatPromptTemplate
 from langgraph.graph import START, StateGraph, END
 from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from prompt_library.prompt import system_prompt
 from utils.llms import LLMModel
 from toolkit.toolkits import *
 from pydantic import BaseModel
 import json
+import re
+from difflib import SequenceMatcher
 
 # 對話歷史改由後端在每次 request 的 messages 欄位傳入，不再使用 LangGraph checkpointer
 
@@ -20,6 +22,165 @@ def get_latest_human_message(messages):
         if isinstance(msg, HumanMessage) and msg.content:
             return msg.content
     return ""
+
+
+# 「具體問句」偵測（確定性，不靠 LLM）：有問號或疑問詞即視為客人在問明確問題。
+# 用途：關懷罐頭原本會「短路」直接回傳、吃掉客人的問題（例：「為何不建議熱磁減脂」只拿到 1-7 問卷）。
+# 判定為具體問句時改成「先回答問題、罐頭原文附在最後」，罐頭內容一字不改。
+_SPECIFIC_Q_RE = re.compile(
+    r"[?？]|為何|為什麼|為甚麼|有何|差異|差別|哪個|哪種|哪一|怎麼|如何|多久|幾次|幾分鐘|幾堂|"
+    r"會不會|可不可以|可以嗎|要嗎|是不是|有沒有|能不能|適合|建議"
+)
+
+
+def _is_specific_question(text) -> bool:
+    """客人這句是否為『具體問句』（有問號或疑問詞）。"""
+    if isinstance(text, list):   # content 可能是 [{'type':'text','text':...}] 結構
+        text = " ".join(
+            str(p.get("text", "")) if isinstance(p, dict) else str(p) for p in text
+        )
+    return bool(_SPECIFIC_Q_RE.search(str(text or "")))
+
+
+# 各節點餵給 LLM 的歷史上限（1 輪 = 客人 + AI 共 2 則）
+SUPERVISOR_HISTORY_MSGS = 6   # supervisor 路由只需最近 3 輪即可判斷意圖
+GEN_HISTORY_MSGS = 30         # information / booking 生成需較多上下文（最近 10 輪，供代名詞/療程追蹤）
+
+
+def trim_history(messages, max_msgs):
+    """截短要餵給 LLM 的歷史：只保留最近 max_msgs 則「對話」訊息（human/ai），
+    但**完整保留所有 SystemMessage**（如後端注入的 [費用資訊] / [廣告來源]），
+    避免把價格等關鍵約束一起截掉。SystemMessage 維持在最前面。
+
+    註：只影響本次餵給 LLM 的輸入，state 內的完整歷史不變（後續節點仍讀得到）。
+    """
+    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+    convo = [m for m in messages if not isinstance(m, SystemMessage)]
+    if len(convo) > max_msgs:
+        convo = convo[-max_msgs:]
+    return system_msgs + convo
+
+
+# ── 診所分店靜態資訊：確定性「原文直出」，答案 100% 來自 CSV、不經 LLM 生成，杜絕地址幻覺 ──
+_CLINIC_PARKING_KW = ("停車", "開車", "停車場")
+_CLINIC_LOCATION_KW = ("地址", "在哪", "哪裡", "位置", "怎麼去", "怎麼走", "怎麼到", "地點", "門牌", "怎麼過去", "怎麼到達")
+_CLINIC_HOURS_KW = ("看診時間", "營業時間", "門診時間", "幾點")
+_CLINIC_PHONE_KW = ("電話", "聯絡電話", "市話")
+_CLINIC_BRANCH_ASK = "請問您想了解哪一間"   # 反問哪一間分店的固定句指紋（供後續辨識客人在回答分店）
+
+
+def _clinic_msg_text(m):
+    c = m.content
+    if isinstance(c, list):
+        return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return c or ""
+
+
+def _resolve_qa_treatment_from_history(messages):
+    """need_qa 但 planner 判不出療程（qa_treatment 空）時的確定性回補：
+    從對話歷史「由新往回」掃最近提到的療程別名，回傳該療程的別名群組
+    （TREATMENT_SYNONYMS 裡的一組 set）；掃不到回 None。
+
+    用既有的 TREATMENT_SYNONYMS 當比對詞庫（含 Emface/菲斯波 這類別名），
+    療程增減沿用那份清單即可，不需另外維護；也避免直接用 treatment_qa 的 category
+    （EMFACE vs Emface、瘦瘦針 vs 瘦瘦筆等大小寫/別名不一致）掃歷史會漏。
+    """
+    for m in reversed(messages or []):
+        low = _clinic_msg_text(m).lower()
+        if not low:
+            continue
+        for group in TREATMENT_SYNONYMS:
+            if any(alias.lower() in low for alias in group):
+                return group
+    return None
+
+
+def _treatment_group(name):
+    """回傳含 name 的 TREATMENT_SYNONYMS 群組（別名 set）；找不到就回 {name}。"""
+    low = (name or "").lower()
+    if not low:
+        return set()
+    for group in TREATMENT_SYNONYMS:
+        if any(a.lower() in low or low in a.lower() for a in group):
+            return group
+    return {name}
+
+
+def _cat_matches_group(cat, group):
+    """treatment_qa 的 category 是否對應到某療程別名群組（大小寫／子字串寬鬆比對）。"""
+    c = (cat or "").strip().lower()
+    if not c or not group:
+        return False
+    gl = {a.lower() for a in group}
+    return any(c == g or g in c or c in g for g in gl)
+
+
+def _clinic_topic(text):
+    """判斷客人問的診所靜態資訊主題 → 對應 clinics_qa 的 category 尾綴（交通=地址/看診/電話，停車=停車）。"""
+    if any(k in text for k in _CLINIC_PARKING_KW):
+        return "停車"
+    if any(k in text for k in _CLINIC_LOCATION_KW + _CLINIC_HOURS_KW + _CLINIC_PHONE_KW):
+        return "交通"
+    return None
+
+
+def _clinic_branch(text):
+    if "竹北" in text:
+        return "竹北"
+    if "台北" in text or "臺北" in text or "信義" in text:
+        return "台北"
+    return None
+
+
+def clinic_info_direct_answer(messages):
+    """診所靜態資訊（地址/停車/看診/電話）→ 回傳「原文直出」的答案字串；非此類問題回 None（交給 booking 的 react agent）。
+
+    - 分店 + 主題都判斷得出 → 直接回 clinics_qa 該筆答案（原文，不經 LLM，地址不可能幻覺）。
+    - 有主題但沒指明分店 → 回固定句反問「台北還是竹北」。
+    - 客人上一輪被問「哪一間」、這輪只回分店名 → 回頭找原主題再直出。
+    """
+    cur = get_latest_human_message(messages)
+    cur = cur[0]["text"] if isinstance(cur, list) else (cur or "")
+    cur = cur.strip()
+    if not cur:
+        return None
+
+    topic = _clinic_topic(cur)
+    branch = _clinic_branch(cur)
+
+    # 後續回答分店：當前只給分店名、沒主題，且上一則 AI 正是我們在反問哪一間 → 回頭找原主題
+    if branch and not topic:
+        last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+        if last_ai and _CLINIC_BRANCH_ASK in (last_ai.content or ""):
+            for m in reversed(messages):
+                if isinstance(m, HumanMessage):
+                    tp = _clinic_topic(_clinic_msg_text(m))
+                    if tp:
+                        topic = tp
+                        break
+
+    if not topic:
+        return None   # 不是診所靜態資訊問題 → 交給 react agent
+
+    # 這句有主題但沒指明分店：若客人稍早已講過分店，沿用它（sticky branch），不要重問一次。
+    # 例：客人先問「竹北地址」得到答覆後，接著只問「有停車嗎」→ 續用竹北，直接回竹北停車。
+    if not branch:
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                b = _clinic_branch(_clinic_msg_text(m))
+                if b:
+                    branch = b
+                    break
+
+    if not branch:
+        return f"我們有台北信義店和竹北店，{_CLINIC_BRANCH_ASK}呢？😊"
+
+    answer = CLINIC_INFO_ROWS.get(f"{branch}{topic}")
+    if not answer:
+        print(f"[clinic_info] 查表缺 {branch}{topic} → 交回 react agent")
+        return None
+    print(f"[clinic_info] 原文直出 {branch}{topic}")
+    return answer
 
 
 # def is_end(state):
@@ -43,6 +204,31 @@ class GuardResult(TypedDict):   # prompt injection 偵測結果
     should_block: bool
     reason: str
 
+class InfoPlan(TypedDict):   # information_node 前置規劃（取代 ReAct 的決策迴圈）
+    symptom_tag: Literal["皺紋類", "私密療程", "睡眠與神經", "體態管理", "皮膚其他", ""]
+    need_empathy: bool   # 是否首次偵測新症狀、需要同理追問
+    need_search: bool    # 是否需要查療程資料庫（介紹 / 推薦）
+    search_query: str    # 丟給 retriever 的「原始症狀詞」（空白分隔），need_search=False 時為空
+    need_qa: bool        # 是否在問「某療程的具體問答」（效果/修復期/會不會痛/保養/副作用/與他者差別…）
+    qa_treatment: str    # need_qa=True 時，問題對應的療程名（從上下文判斷，如「冷凍減脂」）；判斷不出回 ""
+    qa_query: str        # need_qa=True 時，客人的問題本身（如「有沒有修復期」）；need_qa=False 時回 ""
+    intro_treatment: str # 客人要「介紹某單一指名療程 / 有沒有某療程 / 某療程是什麼 / 功效」時填該療程名，
+                         # 觸發原文直出 CSV 介紹；症狀求推薦、比較兩療程、問具體子問題（會不會痛/多少錢/修復期）→ 回 ""
+
+class FactCitation(TypedDict):   # moderator 事實核對：一條療程硬事實 + 它的逐字出處
+    claim: str   # 草稿中的療程硬事實（英文全名/縮寫/原理/數據/機器品牌名/是否提供某療程）
+    quote: str   # 從【診所資料】逐字複製、能支持該 claim 的原文；找不到依據時回空字串 ""
+
+class ModeratorAudit(TypedDict):   # moderator 事實核對的結構化輸出
+    facts: List[FactCitation]   # 草稿裡所有療程硬事實 + 逐字出處
+    cleaned: str                # 已做合規/語氣/語言清理、但療程事實原封不動的草稿
+
+def merge_trace(left: dict, right: dict) -> dict:
+    """trace 欄位的 reducer：各節點各寫各的 key，淺層合併累積成整輪 trace。
+    graph 為線性執行、節點不會同時搶寫同一 key，淺層 merge 即安全。"""
+    return {**(left or {}), **(right or {})}
+
+
 class AgentState(TypedDict):
     messages: Annotated[list[Any], add_messages]
     fb_account: str
@@ -51,17 +237,44 @@ class AgentState(TypedDict):
     current_reasoning: str
     booking_completed: bool  #0716
     should_terminate: bool  #
+    force_handoff: bool  # moderator 事實核對失敗 → 通知 backend 轉真人客服（CallCS=1）
+    skip_moderation: bool  # 診所資訊原文直出時設 True → moderator 直通不改寫（保護地址/門牌）
+    skip_fact_check: bool  # booking 回覆設 True → moderator 只做語氣/合規清理，跳過檢索式事實核對
+                           # （booking 內容來自費用表/consult 表等確定性來源＋已有價格守門，不該過療程檢索的 faithfulness）
+    trace: Annotated[dict, merge_trace]  # LLM-as-judge 評估用軌跡；各節點累積寫入，backend 端補 user_input/handoff_reason 後回傳
 
 
 class DoctorAppointmentAgent:
     def __init__(self):
-        llm_model = LLMModel() #openai
+        # Composer（客服回覆生成）：temperature 0.3 —— 保留一點自然語感，
+        # 但遠低於 OpenAI 預設 1.0，避免同一問題語意飄移。
+        llm_model = LLMModel(temperature=0.3) #openai
         self.llm_model=llm_model.get_model()  #openai
         # llm_model = LLMModel(use_json_format=True)
         # self.llm_model=llm_model.get_model()
 
+        # ── 以下皆為「判斷/分類」任務 → temperature=0（LLMModel 預設），求穩定不求變化 ──
+
         # prompt injection 守門用的輕量模型（便宜、低延遲）
         self.guard_model = LLMModel("gpt-4o-mini").get_model()
+
+        # supervisor(路由)用的輕量模型：只做「下一步交給哪個 worker」的分類（結構化輸出），
+        # 屬低風險分類任務，用 mini 即可，藉此降低每輪路由的延遲與成本。
+        self.supervisor_model = LLMModel("gpt-4o-mini").get_model()
+
+        # moderator(輸出審查)用的輕量模型：純語氣/錯字/合規清理（本輪沒檢索到療程內容時用），
+        # 屬於低風險的文字清理任務，用 mini 即可，藉此降低每則回覆的延遲與成本。
+        self.moderator_model = LLMModel("gpt-4o-mini").get_model()
+
+        # moderator 在「本輪有檢索到療程內容」時，還要做事實核對（faithfulness），
+        # 判斷療程事實有沒有依據是高風險任務 → 用強模型，避免 mini 把編造的當成有依據。
+        # ⚠️ 刻意「不共用」Composer 的實例：事實核對屬判斷任務，必須 temperature=0，
+        #    不能跟著 Composer 的 0.3 一起飄（同一段草稿可能一下判有依據、一下判沒依據 → 誤轉真人）。
+        self.moderator_fact_model = LLMModel("gpt-4o").get_model()  # gpt-4o, temperature=0
+
+        # information_node 前置規劃用的輕量模型：只做症狀分類/決定檢索詞（結構化輸出），
+        # 取代原本 ReAct 迴圈裡用 gpt-4o 反覆判斷工具呼叫，分類任務用 mini 即可。
+        self.info_planner_model = LLMModel("gpt-4o-mini").get_model()
 
     def start_node(self, state: AgentState):
         print("start_node called")
@@ -136,11 +349,12 @@ class DoctorAppointmentAgent:
                                     "如果有醫美療程、保養、身體健康或預約的問題，都很歡迎問我 💕",
                             name="guard_node",
                         )
-                    ]
+                    ],
+                    "trace": {"guard": {"blocked": True, "reason": response.get("reason", "")}},
                 },
             )
 
-        return Command(goto="supervisor")
+        return Command(goto="supervisor", update={"trace": {"guard": {"blocked": False, "reason": ""}}})
 
     # supervisor_node 修正
     def supervisor_node(self, state: AgentState) -> Command[Literal['information_node', 'booking_node', '__end__']]:
@@ -167,10 +381,19 @@ class DoctorAppointmentAgent:
 
         2. WORKER: booking_node
         - 費用預算：療程多少錢、有沒有分期、體驗價、單次費用、療程費。
+        - **療程時長**：體驗多久 / 做多久 / 療程多久 / 幾分鐘 / 時長 —— 因為體驗時間就寫在
+          費用表的療程名稱裡（如「SIS 科技深層精雕(15分鐘)」），**視同費用問題**由 booking 回答。
+          ⚠️ 但「多久**有效** / 多久**看到效果**」是療程問答，走 information_node，不在此列。
+        - **方案包含幾次**：「這個方案幾次 / 幾堂 / 包含幾次 / 5999 是幾次」——
+          問的是**某個價格方案的內容**（每筆方案皆為一堂），屬費用範疇由 booking 回答。
+          💡 辨識：句中出現**價格數字**（如 5999）＋「幾次」→ 幾乎必定是問方案內容 → booking。
+          ⚠️ 但「做**幾次****才有效果** / 幾次會比較**明顯** / 幾次**有用**」是**療效建議**，
+             走 information_node，不在此列（句中有「效果／有效／有用／明顯／才」即屬此類）。
         - 促銷活動：活動、優惠、促銷、檔期、最近有什麼、現在有什麼方案、套裝、打折。
-        - 診所資訊：地址、電話、營業時間、初診流程、諮詢費、初診費。
+        - 診所資訊：地址、電話、營業時間、初診流程、諮詢費、初診費、分店 / 據點 / 有幾間店 / 其他地區有沒有店、你們在哪 / 在哪裡 / 位置 / 怎麼走 / 怎麼去 / 怎麼到 / 停車。
+        - 健保 / 保險：會不會註記健保、健保雲端、健保給付、可以申請保險 / 理賠嗎、是不是自費 —— 這類屬診所政策 FAQ（答案在 clinics_qa）。
         - 預約管理：預約療程、更改預約時間、取消預約。
-        *判斷原則：訊息包含錢、活動 / 優惠 / 檔期、地點、時間、具體預約動作。*
+        *判斷原則：訊息包含錢、活動 / 優惠 / 檔期、地點、分店 / 據點、時間、具體預約動作。*
 
         3. WORKER: FINISH
         功能：對話結束。
@@ -181,8 +404,8 @@ class DoctorAppointmentAgent:
         判斷原則：
 
         1. 使用者打招呼（「你好」「哈囉」「嗨」「有人嗎」）或開場 → {"next": "information_node", "reasoning": "使用者開場，引導需求"}
-        2. 使用者詢問療程內容、健康問題、症狀 → {"next": "information_node", "reasoning": "...理由..."}
-        3. 使用者訊息包含「費用」「價錢」「價格」「多少」「初診」「地址」「電話」「預約」「改期」「取消」「時間」「活動」「優惠」「促銷」「檔期」「方案」「套裝」「打折」等字眼 → {"next": "booking_node", "reasoning": "...理由..."}
+        2. 使用者詢問療程內容、健康問題、症狀，或某療程的「專屬問答」（怎麼計算 / 單點雙點 / 會不會痛 / 效果如何 / 多久有效 / 幾次 / 修復期 / 副作用禁忌 / 原理 / 跟另一個療程差別）→ {"next": "information_node", "reasoning": "...理由..."}
+        3. 使用者訊息包含「費用」「價錢」「價格」「多少」「體驗多久」「做多久」「幾分鐘」「時長」「初診」「地址」「電話」「在哪」「在哪裡」「哪裡」「位置」「怎麼走」「怎麼去」「怎麼到」「停車」「分店」「據點」「有幾間店」「其他地區有沒有店」「預約」「改期」「取消」「時間」「活動」「優惠」「促銷」「檔期」「方案」「套裝」「打折」「健保」「保險」「理賠」「自費」等字眼 → {"next": "booking_node", "reasoning": "...理由..."}
         4. 使用者**明確**表達結束意圖（「謝謝沒事了」「不用了」「掰掰」）→ {"next": "FINISH", "reasoning": "..."}
         5. 模糊或無法判斷時 → 預設走 information_node（讓 AI 主動引導），**不要走 FINISH**
 
@@ -193,6 +416,14 @@ class DoctorAppointmentAgent:
         而且**整句沒有指名任何具體療程**（NEO、EMBODY、冷凍、Emface、皮秒…都沒提到）→ 走 **information_node**，不是 booking_node。
         原因：客人這樣問代表他還不知道該做哪個療程，應由 information_node 先推薦適合的療程，等客人選定療程後，下一輪再進 booking_node 報價。
         反之，若句中**已指名具體療程**（例如「NEO 多少錢」「Emface 體驗價」）→ 照規則 3 走 booking_node。
+
+        🚨 booking / information 的界線（最高原則，凌駕其他規則）：
+        - **booking_node 只收這幾類**：
+          ① 療程費用 / 體驗價 / 單次價；② 優惠 / 活動 / 方案 / 檔期；③ 初診費 / 諮詢檢測費；
+          ④ 具體預約動作（預約 / 改期 / 取消）；⑤ 診所靜態資訊（地址 / 停車 / 電話 / 看診時間 / 分店 / 在哪）。
+        - **其餘只要是關於「療程本身」的問題一律走 information_node** —— 它是什麼、怎麼做 / 怎麼計算、
+          單點雙點、效果如何、會不會痛、多久有效、幾次、修復期、副作用禁忌、原理、跟另一療程差別、推薦哪個…
+          **即使夾在費用 / 預約對話中也一樣**（例：剛聊完冷凍價格，客人接著問「那雙點是什麼」→ information_node）。
 
         範例：
 
@@ -214,8 +445,20 @@ class DoctorAppointmentAgent:
         使用者：你們最近有什麼優惠？
         回覆：{"next": "booking_node", "reasoning": "使用者詢問優惠方案，屬費用範疇"}
 
+        使用者：（剛聊完冷凍減脂價格）那雙點是什麼？
+        回覆：{"next": "information_node", "reasoning": "詢問療程專屬問答（單雙點/怎麼計算），屬療程內容，非費用"}
+
+        使用者：冷凍減脂會不會痛？
+        回覆：{"next": "information_node", "reasoning": "詢問療程專屬問答（會不會痛），屬療程內容"}
+
         使用者：我要預約下週一的療程
         回覆：{"next": "booking_node", "reasoning": "使用者要求預約"}
+
+        使用者：你們有沒有其他分店？
+        回覆：{"next": "booking_node", "reasoning": "使用者詢問分店/據點，屬診所資訊範疇"}
+
+        使用者：你們在哪？
+        回覆：{"next": "booking_node", "reasoning": "使用者詢問診所地點/地址，屬診所資訊範疇"}
 
         使用者：謝謝，沒其他問題了
         回覆：{"next": "FINISH", "reasoning": "使用者明確表達結束對話"}
@@ -231,9 +474,9 @@ class DoctorAppointmentAgent:
         # openai
         messages_for_llm = [
             {"role": "system", "content": system_prompt},
-        ] + state["messages"] # 包含所有歷史訊息
+        ] + trim_history(state["messages"], SUPERVISOR_HISTORY_MSGS) # 路由只需最近 3 輪
 
-        response = self.llm_model.with_structured_output(Router).invoke(messages_for_llm) # 使用修正後的 messages_for_llm
+        response = self.supervisor_model.with_structured_output(Router).invoke(messages_for_llm) # 路由分類用 mini
 
         print("supervisor_node response:", response)
 
@@ -248,6 +491,8 @@ class DoctorAppointmentAgent:
         print("********************************")
         print(response["reasoning"])
             
+        route_trace = {"route": goto, "route_reasoning": response["reasoning"]}
+
         if goto == "FINISH":
             return Command(
                 goto=END,
@@ -255,7 +500,8 @@ class DoctorAppointmentAgent:
                     'next': END,
                     'current_reasoning': response["reasoning"],
                     # 覆蓋舊訊息，確保結束時不會重播上一則
-                    'messages': [AIMessage(content="感謝您的諮詢，如有任何問題，請隨時與我們聯繫。")]
+                    'messages': [AIMessage(content="感謝您的諮詢，如有任何問題，請隨時與我們聯繫。")],
+                    'trace': route_trace,
                 }
             )
 
@@ -264,12 +510,14 @@ class DoctorAppointmentAgent:
             return Command(goto=goto, update={
                 'next': goto,
                 'query': query,
-                'current_reasoning': response["reasoning"]
+                'current_reasoning': response["reasoning"],
+                'trace': route_trace,
             })
 
         return Command(goto=goto, update={
             'next': goto,
-            'current_reasoning': response["reasoning"]
+            'current_reasoning': response["reasoning"],
+            'trace': route_trace,
         })
 
 
@@ -279,138 +527,335 @@ class DoctorAppointmentAgent:
     def information_node(self, state: AgentState) -> Command[Literal['supervisor']]:
         print("*****************called information node************")
 
+        # ── 階段 1：Planner（取代 ReAct 迴圈的決策）────────────────────────
+        # 用輕量模型一次決定：症狀標籤、要不要同理、要不要檢索、檢索詞。
+        # 取代原本 gpt-4o 在 ReAct 裡反覆「想 → 呼叫工具 → 再想」的多次往返。
+        planner_prompt = """
+            你是醫美客服的前置分析器。根據「對話歷史」與「使用者最新訊息」輸出結構化規劃，
+            供後續流程查資料與回覆。你**不要**直接回答使用者，只輸出規劃欄位。
 
-        raw_system_prompt = """
+            1. symptom_tag：把使用者需求歸到下列標準標籤之一；無法歸類或非症狀需求則回空字串 ""：
+               - 皺紋類（細紋、法令紋、木偶紋、紋路、抬頭紋、臉部皺巴巴）
+               - 私密療程（性功能、私密處）
+               - 睡眠與神經（失眠、睡不好、打呼、自律神經失調、壓力大、心悸）
+               - 體態管理（胖、減脂、肚子大、瘦身）
+               - 皮膚其他（痘痘、斑點、膚色不均）
+
+            2. need_empathy：是否需要「同理追問」——用一句關懷引導客人多描述自己的困擾。
+               ✅ 只在「客人**首次傾訴某個困擾／症狀**、資訊還很模糊、需要引導他多說」時才為 true
+                  （例如：「我最近睡不好」「想瘦身」「臉看起來好累」）。
+               ❌ 以下一律 false：
+                  - 客人在**問某療程的具體問題**（修復期、會不會痛、效果如何、多久有效、幾次、
+                    費用、術後保養、原理、比較哪個好）→ false。這是要「查答案」，不是要被關懷，
+                    硬給關懷罐頭會蓋掉客人真正的問題。
+                  - 已回答過上一輪追問、或已提供具體部位／嚴重程度 → false（嚴禁重複追問）。
+                  - **客人在回答上一輪的「數字症狀問卷」**（回了數字如「12345」）→ false。
+                    他已經答完了，這輪要「推薦療程」不是再關懷（見 need_search 第 3 點）。
+                  - 純打招呼、純道謝 → false。
+
+            3. need_search：是否需要查詢療程資料庫。
+               - 只要使用者在問療程、原理、效果、修復期、會不會痛、適合什麼療程、比較療程，
+                 或用「部位/改善目標」問價（如「法令紋的療程多少」「瘦大腿怎麼收費」）→ true。
+               - 純打招呼、純道謝、只回應上一輪追問且還沒要看療程 → false。
+               - **⭐ 客人在回答上一輪的「數字症狀問卷」**（上一則 AI 列了一份編號症狀清單、
+                 結尾請客人「回數字」，而客人這輪就回了數字，如「12345」「1、3、5」「1 2 3」）
+                 → **need_search=true**。這代表客人已描述完困擾，該進入「推薦療程」階段了，
+                 **不可**再判成「只回應追問」而關掉檢索。
+
+            4. search_query：要丟給療程檢索的關鍵字。
+               - **必須用使用者原始症狀詞**（例如「法令紋」「木偶紋」「瘦大腿」），
+                 **絕對不可**用分類標籤（不可寫「皺紋類」「皮膚其他」），否則檢索不到正確療程。
+               - 多個症狀或比較題，用空白把原始詞串起來（例如「法令紋 木偶紋」「Emface 音波」）。
+               - **⭐ 客人回數字問卷時**：對照上一則 AI 問卷，把客人**選到的那幾項症狀文字**取出來串成
+                 檢索詞（例：問卷「1.睡不好淺眠 2.打呼呼吸中止 3.長期依賴藥物…」+ 客人回「12」
+                 → search_query="睡不好 淺眠 打呼 呼吸中止"）。只取客人有選的號碼，沒選的不要放。
+               - need_search 為 false 時回空字串 ""。
+
+            5. need_qa：使用者是否在問「**某個療程的具體問答**」——例如效果如何、多久有效、會不會痛、
+               有沒有修復期、會不會復胖、術後保養、生理期／哺乳期能不能做、副作用禁忌、跟另一個療程差別、
+               怎麼計算次數等。
+               - 是 → true。（這類是要「查該療程的標準答案」，不是要被同理關懷）
+               - 只是要療程介紹／推薦，或一般診所問題（地址／付款／初診費）→ false。
+
+            6. qa_treatment：need_qa=true 時，這個問題是針對**哪個療程**（從本輪或上文判斷，
+               例：冷凍減脂、SIS、Emface、瘦瘦針）。判斷不出來則回空字串 ""。
+               - 客人用代名詞（「這個」「它」）時，往上文找最近在談的療程。
+
+            7. qa_query：need_qa=true 時，**客人的問題本身**（例：「有沒有修復期」「會不會復胖」「跟EMBODY差別」）。
+               need_qa=false 時回 ""。
+
+            8. intro_treatment：客人是否想「大致認識某**一個**明確指名的療程」——
+               例：「有沒有 SIS」「介紹一下 Emface」「冷凍減脂是什麼」「NEO 有什麼功效」「你們的瘦瘦筆」。
+               - 是 → 填該療程名（從本輪或上文判斷，如「SIS」「Emface」「冷凍減脂」）。
+               - 以下一律回空字串 ""：
+                 · 描述症狀求推薦（「我想瘦肚子」「臉鬆」）——那要在多療程中推薦，不是介紹單一療程。
+                 · 比較兩個療程（「SIS 跟冷凍差在哪」）。
+                 · 問某療程的具體子問題（會不會痛 / 多少錢 / 修復期 / 幾次…，這些走 need_qa）。
+                 · 沒指名到任何具體療程。
+               （此欄一旦填了，系統會直接把該療程的官方介紹原文回給客人。）
+        """
+        messages_for_planner = [{"role": "system", "content": planner_prompt}] + state["messages"]
+        plan = self.info_planner_model.with_structured_output(InfoPlan).invoke(messages_for_planner)
+        print("information planner:", plan)
+
+        # 確定性防呆：客人本輪已用「數字」回覆（多半是講年齡，如「40+」「45歲」「四十」），
+        # 代表資訊已足夠 → 關掉同理短路、直接進推薦，避免關懷罐頭重複追問年齡。
+        # 只認阿拉伯數字 /「歲」/ 中文整十（二十～九十）；不認單一「一二三」，以免「一下」「一點」誤判。
+        latest_user = str(get_latest_human_message(state["messages"]) or "")
+        if plan.get("need_empathy") and re.search(r"\d|歲|[一二兩三四五六七八九]十", latest_user):
+            print(f"[empathy] 本輪含數字（疑似年齡）→ 關閉同理追問、直接推薦：{latest_user!r}")
+            plan["need_empathy"] = False
+            if plan.get("symptom_tag"):
+                plan["need_search"] = True
+
+        # ── 單一指名療程「介紹」→ 原文直出 CSV，一字不改，杜絕 AI 自編英文全名/縮寫/原理/數據 ──
+        intro_t = (plan.get("intro_treatment") or "").strip()
+        if intro_t:
+            intro = get_treatment_intro(intro_t)
+            if intro:
+                # 登錄成合法療程 + 事實來源（與檢索路徑一致，維持 trace/後處理相容）
+                cur = authorized_treatments_var.get() or set()
+                cur.add(intro_t)
+                authorized_treatments_var.set(cur)
+                register_grounded_content(intro)
+                verbatim = (
+                    f"為您介紹一下我們的 {intro_t} 😊\n\n{intro}\n\n"
+                    "想了解費用、適不適合您，或想預約諮詢評估，都可以再告訴我哦 💕"
+                )
+                print(f"[treatment_intro] 原文直出：{intro_t}")
+                return Command(
+                    update={
+                        "messages": state["messages"] + [
+                            AIMessage(content=verbatim, name="information_node")
+                        ],
+                        "skip_moderation": True,   # 原文直出 → moderator 直通，不改寫（100% 來自官方 CSV）
+                    },
+                )
+            print(f"[treatment_intro] {intro_t!r} 無對應 CSV 介紹 → 退回一般檢索流程")
+
+        # ── 階段 2：確定性工具呼叫（零 LLM）──────────────────────────────
+        # 同理素材：固定查表；檢索：直接呼叫 retriever（會註冊 authorized_treatments_var，sanitize 依賴它）。
+        empathy = None
+        if plan.get("need_empathy") and plan.get("symptom_tag"):
+            empathy = get_empathy_questions_by_symptom.invoke({"symptom_tag": plan["symptom_tag"]})
+            print("empathy material:", empathy)
+
+        # ── 逐類別防重複：同一症狀類別的關懷罐頭，整段對話只發一次。
+        #    用該類別罐頭「問句的第一行」當指紋，掃歷史 AI 訊息；出現過 → 不再短路、也不再帶
+        #    empathy 給 Composer（避免重複關懷）。不同類別指紋不同，互不影響——
+        #    例如先談失眠關懷過，之後問體雕，體雕的罐頭仍會跳一次。
+        if empathy:
+            q = empathy.get("questions", "")
+            first_q = (q[0] if isinstance(q, list) and q else q) or ""
+            fingerprint = str(first_q).split("\n", 1)[0].strip()
+            already_sent = bool(fingerprint) and any(
+                isinstance(m, AIMessage) and fingerprint in (m.content or "")
+                for m in state["messages"][:-1]   # 排除本輪最新的 human 訊息
+            )
+            if already_sent:
+                print(f"[empathy] 類別「{plan.get('symptom_tag')}」已關懷過 → 不短路，照常走檢索/Composer")
+                empathy = None
+
+        # ── 短路：首次把客人歸類到某症狀類別時，直接「原文」回傳關懷 + 固定追問，
+        #    不進 Composer（不被 LLM 改寫）、本輪也不檢索 / 不推薦療程。
+        #    等客人回覆（例如選 1～7）下一輪再走檢索推薦，達成「先問、再推薦」。
+        #    ⚠️ 因為是原文直出，get_empathy_questions_by_symptom 裡的字串必須是乾淨成品
+        #       （不可有 /n 或殘留縮排），否則會原樣呈現給客人。
+        #    無法歸類（symptom_tag 為空）或已關懷過時 empathy 為 None，不進此短路，照舊走檢索 + Composer。
+        # ⭐ 罐頭「內容一字不改」，只改出場方式：
+        #    客人這句若是**具體問句**（有問號或疑問詞）→ 不短路，先回答問題、罐頭原文附在最後，
+        #    避免罐頭把客人真正的問題吃掉（例：「為何不建議熱磁減脂」只拿到 1-7 問卷）。
+        #    仍是**模糊講困擾**（「我想瘦肚子」）→ 維持原本短路，只發罐頭，保住「先問再推薦」。
+        empathy_verbatim = None
+        if empathy:
+            parts = [str(empathy.get("empathy", "")).strip()]
+            q = empathy.get("questions", "")
+            if isinstance(q, list):
+                parts.extend(str(x).strip() for x in q)
+            elif q:
+                parts.append(str(q).strip())
+            empathy_verbatim = "\n\n".join(p for p in parts if p)
+
+        if empathy and _is_specific_question(latest_user):
+            print("[empathy] 本輪是具體問句 → 不短路：先回答問題，罐頭原文附在最後")
+            empathy = None      # 不傳進 Composer，避免與最後附加的罐頭重複
+
+        if empathy:
+            verbatim = empathy_verbatim
+            empathy_verbatim = None   # 已由短路輸出，結尾不再附加
+            print("[empathy short-circuit] 原文直出，跳過 Composer 與檢索")
+            return Command(
+                update={
+                    "messages": state["messages"] + [
+                        AIMessage(content=verbatim, name="information_node")
+                    ]
+                },
+            )
+
+        retrieval = None
+        if plan.get("need_search"):
+            query = (plan.get("search_query") or "").strip() or get_latest_human_message(state["messages"])
+            retrieval = search_clinics_by_keyword.invoke({"symptom": query})
+            print(f"retrieval done for query: {query!r}")
+
+        # ── 療程內容問答：客人問某療程的具體問題（效果/修復期/會不會痛/差別…）→ 查 treatment_qa。
+        #    療程名 + 問題一起查，才分得出是哪個療程的答案。
+        # planner 判 need_qa 但沒判出 qa_treatment（代名詞/上下文沒解析到）→ 從歷史確定性回補，
+        # 否則像「你們是計算發數嗎」這種無主詞問句會整個跳過 QA 檢索、Composer 只能憑空回答。
+        qa_treatment = (plan.get("qa_treatment") or "").strip()
+        qa_group = None            # 回補時鎖定的療程別名群組（供下方 category 防呆）
+        used_qa_fallback = False
+        if plan.get("need_qa") and not qa_treatment:
+            qa_group = _resolve_qa_treatment_from_history(state["messages"])
+            if qa_group:
+                qa_treatment = sorted(qa_group)[0]   # 取群組裡一個代表詞當檢索 boost
+                used_qa_fallback = True
+                print(f"[treatment_qa] planner 未判出療程 → 由歷史回補：{qa_treatment}（群組 {sorted(qa_group)}）")
+
+        qa_answer = None
+        if plan.get("need_qa") and qa_treatment:
+            t = qa_treatment
+            qa_q = (plan.get("qa_query") or "").strip()
+            # query 以「問題」為主、療程名只放一次：療程只用來跨療程區隔，不該壓過問題本身，
+            # 否則同療程多筆 QA 之間（差別 / 會痛 / 修復期…）分不出來，會撈到語意最泛的那筆。
+            boosted = f"{qa_q} {t}".strip()
+            qa_docs = treatment_qa_retriever.get_relevant_documents(boosted)   # k=6，見 toolkits
+            # 依 category 過濾成「本療程」的候選，取排序最前那筆——同療程多筆時才挑得到真正對到問題的。
+            target_group = qa_group or _treatment_group(t)
+            matched = [d for d in qa_docs
+                       if _cat_matches_group((d.metadata or {}).get("category", ""), target_group)]
+            if matched:
+                picked = matched[0]
+            elif used_qa_fallback:
+                # 回補路徑本就不確定，過濾後又對不上本療程 → 寧可不 grounding，避免抓到別療程的答案
+                print(f"[treatment_qa] 回補檢索無 category 對得上 {sorted(target_group)} → 放棄 grounding")
+                picked = None
+            else:
+                # planner 明確給了療程但 category 對不上（多半是資料 category 與別名不一致）→ 退回 top-1，維持原行為
+                picked = qa_docs[0] if qa_docs else None
+            if picked is not None:
+                # page_content 帶有「分類／問題／答案／關鍵字」標籤，取出乾淨答案再給 Composer
+                pc = picked.page_content
+                if "答案：" in pc:
+                    pc = pc.split("答案：", 1)[1]
+                if "\n關鍵字：" in pc:
+                    pc = pc.split("\n關鍵字：", 1)[0]
+                qa_answer = pc.strip()
+                # grounding：把這個療程登錄成合法療程，避免後續幻覺檢查誤刪
+                cur = authorized_treatments_var.get() or set()
+                cur.add(t)
+                authorized_treatments_var.set(cur)
+                # 同時把療程問答原始內容登錄為事實來源，供 sanitize faithfulness 核對
+                register_grounded_content(qa_answer)
+                print(f"[treatment_qa] {boosted!r} → 命中 category={(picked.metadata or {}).get('category')!r}，長度 {len(qa_answer)}")
+            else:
+                print(f"[treatment_qa] {boosted!r} → 無結果")
+
+        # ── 階段 3：Composer（單次 gpt-4o 生成，大 prompt 只送一次）──────────
+        composer_prompt = """
             你是一位專業且有同理心的醫美諮詢助理，代表我們診所與顧客對話。
             使用者會輸入症狀或需求，例如「我失眠很嚴重」、「我最近痘痘變多」。
-            若使用者上傳了圖片（例如臉書貼文截圖、照片），請務必仔細閱讀並辨識圖片中的「文字」與「特徵」，並將圖片內容當作使用者的主要需求來進行回應。
+            若使用者上傳了圖片（臉書貼文截圖、照片），請仔細辨識圖片中的「文字」與「特徵」，當作使用者的主要需求回應。
 
-            You run in a loop of Thought, Action, PAUSE, Observation.
-            At the end of the loop you output an Answer
-            Use Thought to describe your thoughts about the question you have been asked.
-            Use Action to run one of the actions available to you - then return PAUSE.
-            Observation will be the result of running those actions.
+            系統已經為你完成「同理素材」與「療程檢索」，結果放在最後一則【系統提供資料】中。
+            你只需「依據那些資料」自然地寫出給顧客的回覆，不要再宣稱要去查詢、不要輸出任何思考過程。
 
-            你可以使用的行動工具包括：
-            - get_empathy_questions_by_symptom：取得針對使用者症狀的同理話語和追問句。
-            - search_clinics_by_keyword：查詢並推薦適合的醫美療程。
+            回覆規則：
+            1. 同理與追問（限一次）：若【系統提供資料】含同理素材，以「同理關懷」為主，
+               把多個追問精簡為「一個」核心問題；若顧客已說明具體部位/嚴重程度，可跳過追問直接專業引導。
+               若無同理素材，代表本輪不需追問，請勿硬問。
+            2. 介紹療程一律以【療程檢索結果】為準：
+               ❌ 嚴禁用訓練知識補充療程的「英文全名、縮寫意義、技術原理、技術別名」
+                  （例如不可自編「SIS (Surface Irregularity Smoothing)」這種英文全名）。
+               ✅ 只能用檢索結果裡的內容介紹。
+               若【系統提供資料】顯示本輪未檢索療程，請勿介紹任何具體療程內容。
+            3. 排除重複：先看對話歷史，若先前已推薦過某些療程，回答「還有什麼」時優先介紹檢索結果中
+               尚未提及的療程；若檢索結果只有已介紹過的療程，**不要捏造新療程**，改為補充
+               「術後保養／治療頻率／適合族群」等更深入細節。
+            4. 先推薦再談價：顧客用「部位/目標」問價但還沒選療程時，
+               根據檢索結果簡短推薦 1~3 個適合療程（只能用白名單內且檢索有撈到的），
+               **不要報價或自編價格**（你沒有費用工具），結尾邀請顧客選定方向，例如
+               「這幾個都蠻適合的，您比較想了解哪一個呢？選定後我可以幫您說明費用與初診安排 💕」。
+            5. 比較問題（如「Emface 跟音波差在哪」）：以檢索結果做中立比較；
+               若某療程檢索查無資料 → 誠實說「該療程目前不在我們提供的範圍，建議諮詢專業團隊或其他診所」，
+               不可用訓練知識補充比較；避免「一定更好」「保證效果」等絕對詞。
+            6. 對比照：要展示前後對比照時，在文字中加入「這是[療程名稱]的對比照: <https 圖片網址>」，
+               例如：這是 Emface 的對比照: https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/emface_ollie_ba.jpg
+               詢問療程效果時可貼對比圖並說明效果因人而異。
+            7. 療程具體問答：若【系統提供資料】含【療程問答】，那是客人所問問題的「標準答案」，
+               請**以它為準**回答，可潤飾語氣、加一句自然關懷，但**不可更改其中的事實、數字、適應症或禁忌**，
+               也不要編造它沒有的內容。這類問題已有明確答案，不需要再硬性追問或硬轉推薦。
+            8. 診所事實防幻覺：關於診所的「分店、據點、有幾間店、地點、地址、電話、營業時間」等事實，
+               若【系統提供資料】中**沒有明確依據，絕對不可自行編造或臆測**
+               （例如嚴禁說「我們在多個地區都有分店」這種沒有根據的話）。
+               這類沒有資料的問題，請改回覆：「這部分我幫您確認一下～稍後由專人為您說明 💕」。
 
-            使用規則：
-            1. 每一回合最多呼叫一個工具。
-            2. 若使用者描述症狀或需求，先分析語意，將其歸類為以下標準標籤之一：
-            [皺紋類] (包含：細紋、法令紋、木偶紋、臉部皺巴巴、紋路)
+            🚨 **療程名稱白名單（絕對重要）** 🚨
+            本診所**只提供**以下療程，**絕對不可以**推薦或提及白名單以外的任何療程：
+            【體雕類】NEO（熱磁減脂）、EMBODY、冷凍減脂（冷脈衝）、SIS、瘦瘦筆（週纖達）
+            【臉部類】Emface（菲斯波）、無限電波、皮秒（PicosurePRO）
+            【私密處類】Alma Duo（震波）、FemiLift、G動椅（Emsella）
+            【睡眠/自律神經類】腦波機（DeepTMS）、EECP、PBM 紅光、NightLase 止鼾雷射
 
-            [私密療程] (包含：性功能、私密處)
-
-            [睡眠與神經] (包含：失眠、睡不好、打呼、自律神經失調、壓力大、心悸)
-
-            [體態管理] (包含：胖、減脂、肚子大、瘦身)
-
-            [皮膚其他] (包含：痘痘、斑點、膚色不均)
-
-            🚨 **標準標籤的用途（兩個工具的輸入不一樣，務必分清楚）** 🚨
-            - 呼叫 `get_empathy_questions_by_symptom` 時 → 傳「**標準標籤名稱**」（例如「皺紋類」）。
-              此工具靠標籤精確比對來取同理語句，必須用標籤。
-            - 呼叫 `search_clinics_by_keyword` 時 → 傳「**使用者原始的症狀詞**」（例如「法令紋」「木偶紋」「毛孔粗大」），
-              **絕對不可以**傳「皺紋類」「皮膚其他」這種分類標籤。
-              原因：檢索是比對療程資料庫的真實內文與關鍵字，資料庫裡有「法令紋」但沒有「皺紋類」這個詞，
-              傳分類標籤會導致檢索不到正確療程（例如把 Emface 排掉）。
-              若使用者一次提到多個症狀詞，用空白把原始詞串起來一起傳（例如「法令紋 木偶紋」）。
-            3. 症狀初步識別與同理 (限一次):
-               若為對話開頭或「首次」偵測到新症狀類別，使用 get_empathy_questions_by_symptom。回覆時以「同理關懷」為主，將工具提供的多個追問精簡為「一個」核心觀察或問題。如果使用者提供的資訊已經很具體（例如：已說明部位或嚴重程度），則跳過追問，直接進行專業引導。
-            4. 🚨 **介紹任何療程前，必須呼叫 search_clinics_by_keyword** 🚨
-
-               以下情境**強制呼叫 retriever**，絕對不可以用自己的訓練知識直接回答：
-               - 客人問「X 是什麼」「介紹一下 X」「X 有什麼效果」「X 是什麼縮寫 / 英文全名」
-               - 客人問「我想了解 X 療程」「X 怎麼運作 / 原理」
-               - 客人問「適合 X 的療程有哪些」「哪些療程可以改善 OO」
-
-               注意：請先檢視對話歷史，若先前已推薦過某些療程，在回答「還有什麼」時，
-               應優先介紹尚未提及的其他療程，或針對已提到的療程提供更深入的細節。
-
-               ❌ 嚴禁：用你訓練知識補充療程的「英文全名、縮寫意義、技術原理、技術別名」
-                      例如不可以說「SIS (Surface Irregularity Smoothing)」之類自己編的英文全名
-               ✅ 只能：用 search_clinics_by_keyword 工具回傳的內容回答
-
-            5. 不要印出Thought, Action, PAUSE過程
-            6. 禁止循環追問：
-               如果使用者已經回答了你上一輪提出的問題（例如他已經選了：飲食、代謝），嚴禁再次呼叫 get_empathy_questions_by_symptom。
-            7. 直接進入解決方案：
-               當使用者回覆了具體原因（如：代謝變慢、飲食不規律）後，你應**呼叫 search_clinics_by_keyword 查詢相關療程**，
-               根據工具回傳的資訊說明改善方向（例如：代謝問題可參考紅光、減脂問題可參考 EMBODY），並詢問是否想深入了解特定療程。
-               **不要**直接用自己的訓練知識描述療程細節。
-            7-1. 客人用「部位/目標」問價，但還沒選療程（例如「瘦大腿根部怎麼收費」「法令紋的療程多少」）：
-                這種情況客人其實還不知道該做哪個療程，**先推薦再談價**：
-                - **必須**先呼叫 search_clinics_by_keyword（傳客人的原始目標詞，如「瘦大腿」「法令紋」）檢索適合療程。
-                - 根據檢索結果，簡短推薦 1~3 個適合的療程（只能用白名單內、且檢索有撈到的療程）。
-                - **不要在這一步報價或自己編價格**（你沒有費用工具，價格一律由後續流程處理）。
-                - 結尾邀請客人選定方向，例如：「這幾個療程都蠻適合改善大腿線條的，您比較想了解哪一個呢？選定後我可以幫您說明費用與初診安排 💕」
-                - 客人下一輪指名療程後，系統會自動轉去查費用，你不用自己報價。
-            8. 如果偵測到使用者在進行「比較問題」（例如「A 和 B 哪個比較好？」「Emface跟音波差在哪裡？」）：
-                - **必須**使用 search_clinics_by_keyword 檢索資料庫，**兩個療程都要查**。
-                - 兩者皆有資料 → 整合工具回傳內容做中立比較。
-                - 其中一項或兩項查無資料 → **誠實回覆**：「該療程目前不在我們提供的療程範圍，
-                  建議您可以諮詢專業團隊或其他診所」。**不可以**用訓練知識補充比較。
-                - 回覆時請保持中立、專業與具體，避免絕對性詞彙（例如「一定更好」、「保證效果」）。
-            9. 當你想要展示療程的前後對比照時，請在回覆文字中加入以下格式：
-                -「這是[療程名稱]的對比照: <圖片網址>」
-                - 例如：這是 Emface 的對比照: https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/emface_ollie_ba.jpg
-                請確保 URL 可直接開啟且以 https 開頭。
-            10. 當詢問療程效果時，可以貼對比圖並說明治療效果因人而異。
-            11. 偵測到細節後直接引導：
-                如果客人已經提供了 2 個以上的關鍵字（例如：飲食+代謝），視為資訊已足夠，不要再問「請問是哪一種？」，改為直接回應：「了解您的困擾主要是飲食與代謝，這兩者確實會互相影響...」。
-            12. 排除重複與事實一致性原則：優先從檢索結果（Observation）中尋找尚未提及的療程進行介紹。嚴禁幻覺：若檢索結果中「只有」先前已介紹過的療程，請勿捏造新療程。此時應採取以下行動：深入細節：針對已提過的療程，提供更具體的「術後保養」、「治療頻率」或「適合族群」等未提及的細節。
-
-            13. 🚨 **療程名稱白名單（絕對重要）** 🚨
-
-               本診所**只提供**以下療程，**絕對不可以**推薦或提及白名單以外的任何療程：
-
-               【體雕類】NEO（熱磁減脂）、EMBODY、冷凍減脂（冷脈衝）、SIS、瘦瘦筆（週纖達）
-               【臉部類】Emface（菲斯波）、無限電波、皮秒（PicosurePRO）
-               【私密處類】Alma Duo（震波）、FemiLift、G動椅（Emsella）
-               【睡眠/自律神經類】腦波機（DeepTMS）、EECP、PBM 紅光、NightLase 止鼾雷射
-
-               ❌ **絕對禁止**提到以下這些**我們沒有**的療程：
-                  射頻緊緻、微針療法、肉毒、玻尿酸、電波拉皮、音波拉皮、雷射除斑、皮秒雷射、
-                  CO2 雷射、淨膚雷射、果酸換膚、水光針、其他任何不在上述白名單的療程
-
-               ❌ 即使你的醫美知識認為某療程可改善客人的問題，**只要不在白名單就不可以提**。
-
-               ✅ 若客人需求**白名單裡找不到合適療程**（例如客人問「除毛」「肉毒紋」這類我們沒有的服務）：
-                  → 誠實回覆：「目前我們診所沒有提供這類療程，建議您可以諮詢其他專科診所」
-                  → **不要**推薦我們沒有的療程當替代品
-                  → **不要**自己編療程名稱
+            ❌ **絕對禁止**提到我們沒有的療程：射頻緊緻、微針療法、肉毒、玻尿酸、電波拉皮、音波拉皮、
+               雷射除斑、皮秒雷射、CO2 雷射、淨膚雷射、果酸換膚、水光針，或任何不在上述白名單的療程。
+            ❌ 即使你的醫美知識認為某療程可改善顧客問題，只要不在白名單就不可以提。
+            ✅ 若白名單裡找不到合適療程（例如「除毛」「肉毒紋」）→ 誠實回覆「目前我們診所沒有提供這類療程，
+               建議您可以諮詢其他專科診所」，不要推薦替代品、不要自編療程名稱。
 
             語氣與內容規範：
-            - 不主動提及任何療程的具體效果、功效或療效。
-            - 除非使用者主動詢問「這個療程可以改善嗎？」或「效果如何？」之類的問題，否則不要主動描述結果。
-            - 當提到療程時，使用保守且中立的語氣，例如「可以幫助改善」、「有些人會選擇這個方式」。
-            - 避免使用絕對或保證性的語句（如「一定會改善」、「效果很好」、「完全消除」等）。
-            - 若診所白名單療程中沒有合適選項，**只能**建議客人「與專業醫師討論」或推薦客人去其他診所，**絕對不可以**用自己的醫美知識編造療程名稱。
+            - 不主動提及療程的具體效果/功效/療效；除非顧客主動問「可以改善嗎？」「效果如何？」才描述。
+            - 提到療程用保守中立語氣（「可以幫助改善」「有些人會選擇這個方式」），
+              避免絕對或保證性語句（「一定會改善」「效果很好」「完全消除」）。
+            - 全程使用繁體中文。
+        """
 
-            請依照上述流程循環執行，直到你能完整回覆使用者需求。
+        context_parts = []
+        if empathy:
+            # questions 可能是 list（見 toolkits.get_empathy_questions_by_symptom），
+            # 串成頓號分隔的字串，避免直接把 ['...','...'] 帶中括號塞進 prompt。
+            questions = empathy.get("questions", "")
+            if isinstance(questions, list):
+                questions = "、".join(str(q).strip() for q in questions)
+            context_parts.append(
+                "【同理素材】（請自然融入：關懷一句 + 最多一個追問）\n"
+                f"關懷：{empathy.get('empathy', '')}\n"
+                f"可用追問：{questions}"
+            )
+        if retrieval is not None:
+            context_parts.append(
+                "【療程檢索結果】（只能依此介紹療程，嚴禁補充這裡沒有的療程名稱／英文全名／原理）\n"
+                f"{retrieval}"
+            )
+        elif not qa_answer:
+            context_parts.append("【療程檢索結果】本輪未檢索療程，請勿介紹任何具體療程內容。")
+        if qa_answer:
+            context_parts.append(
+                "【療程問答】（客人問了某療程的具體問題，以下是資料庫的標準答案。"
+                "請依此回答，可潤飾語氣或加一句開頭關懷，但**不可竄改其中的事實／數字／適應症／禁忌**，"
+                "也不要補充資料裡沒有的內容）\n"
+                f"{qa_answer}"
+            )
+        context_block = "【系統提供資料】\n\n" + "\n\n".join(context_parts)
 
-            現在開始回答使用者的問題：
+        messages_for_composer = (
+            [{"role": "system", "content": composer_prompt}]
+            + trim_history(state["messages"], GEN_HISTORY_MSGS)  # 生成保留最近 10 輪
+            + [{"role": "system", "content": context_block}]
+        )
+        response = self.llm_model.invoke(messages_for_composer)
+        answer = response.content
 
-"""
-        system_prompt_template = ChatPromptTemplate.from_messages(
-    [
-        ("system", raw_system_prompt),  # 給模型的角色說明
-        ("placeholder", "{messages}")   # 用戶輸入與歷史訊息
-    ]
-)
-        information_agent = create_react_agent(model=self.llm_model,tools=[get_empathy_questions_by_symptom, search_clinics_by_keyword] ,prompt=system_prompt_template)
+        # 具體問句情境：先回答問題，再把關懷罐頭「原文」接在後面（文案一字不改）。
+        # 順序刻意是「答案在前、罐頭在後」——先回應客人真正問的，再帶出引導追問的 CTA。
+        if empathy_verbatim:
+            print("[empathy] 於答案後附加關懷罐頭原文")
+            answer = f"{answer}\n\n{empathy_verbatim}"
 
-        result = information_agent.invoke({"messages": state["messages"]})
-        # print('original_answser', result)
-        # print('resulttttttttttttt', result["messages"][-1].content)
-
-        #  11/5 只有回傳文字的時候
         return Command(
             update={
                 "messages": state["messages"] + [
-                    AIMessage(content=result["messages"][-1].content, name="information_node")
-                    # HumanMessage(content=result["messages"][-1].content, name="information_node")
+                    AIMessage(content=answer, name="information_node")
                 ]
             },
         )
@@ -418,8 +863,19 @@ class DoctorAppointmentAgent:
         
     def booking_node(self, state: AgentState) -> Command[Literal['supervisor']]:
         print("*****************called booking node************")
-        
- 
+
+        # ── 診所靜態資訊（地址/停車/看診/電話）：確定性「原文直出」，不進 LLM，杜絕地址幻覺 ──
+        clinic_reply = clinic_info_direct_answer(state["messages"])
+        if clinic_reply is not None:
+            return Command(
+                update={
+                    "messages": state["messages"] + [
+                        AIMessage(content=clinic_reply, name="booking_node")
+                    ],
+                    "skip_moderation": True,   # 原文直出 → moderator 直通，不改寫（保護門牌）
+                },
+            )
+
         system_prompt = """
             你是一位專業且有條理的醫美預約助理，負責幫助使用者：
             1. 預約療程
@@ -438,16 +894,67 @@ class DoctorAppointmentAgent:
             - **search_clinics_info**：當使用者詢問下列項目時使用，此工具只回傳資料庫的固定答案，不要自行生成內容：
               ✅ 診所「地址」、「位置」、「電話」、「怎麼去」、「在哪裡」、「停車」、「看診時間」、「付款方式」、「預約流程」
               ✅ **「初診費用 / 諮詢檢測費」**（療程前的諮詢評估費用）
-              ❌ 嚴禁用此工具查「療程體驗價 / 單次費用」— 體驗價請從 SystemMessage 的 [費用資訊] 區塊查找。
+              ✅ **「健保 / 保險」政策問題**：會不會註記健保、健保雲端快易通、健保給付、可以申請保險 / 理賠嗎、是不是自費
+                 → 呼叫 search_clinics_info("診所", "健保")（保險理賠類用 category "保險"），以資料庫固定答案回覆，不要自己編。
+              ❌ 嚴禁用此工具查「療程體驗價 / 單次費用」— 體驗價請用 **get_treatment_fee** 工具查。
+              ❌ 不要用此工具查「療程介紹 / 適合對象」— 那要用 search_clinics_by_keyword。
+            - **get_treatment_fee**：查某療程的「體驗價」（療程單次／組合方案的價格）。
+              報體驗價時**一定要呼叫這個工具**，帶入你判斷出的療程名（例如 get_treatment_fee("Emface")），
+              以工具回傳的價格為準——**嚴禁**自己從記憶／歷史對話編價。
+              · 客人用代名詞（「這個」「那個」）或只說部位（「臉部」「肚子」）時，先從上文判斷是哪個療程，再帶療程名呼叫。
+              · 若工具回「沒有方案」或「未指定明確療程」→ 照工具指示回覆（沒有方案 / 反問是哪個療程），**不可自己編價**。
+              ❌ **療程專屬問答（怎麼計算 / 單點雙點 / 會不會痛 / 效果如何 / 多久有效 / 幾次 / 修復期等）
+                 不由此工具處理**（它查不到這些）；這類屬「療程內容問答」，不在預約助理的職責內，請勿用 search_clinics_info 硬答。
+                 （註：「健保 / 保險 / 是否自費」屬診所政策 FAQ，**要**用 search_clinics_info 查，見上面 ✅。）
 
             ---
 
             ### 使用規則
             - 客人首次想預約（資料不齊）→ 用 `set_appointment` 給表單
             - 客人已提供完整預約資訊 → 用 `confirm_booking(name, treatment, datetime_pref, contact, special_needs)` 確認轉接
-            - 如果使用者問「診所地址、電話、停車、看診時間」→ 使用 `search_clinics_info`
+            - 如果使用者問「診所地址、電話、停車、看診時間、怎麼去、在哪」→ 使用 `search_clinics_info`。
+              ⚠️ **診所有兩間分店：台北信義店 / 竹北店**，地址、停車、看診時間都各自不同，處理方式：
+                · 客人**沒指明哪一間** → 先反問：「我們有台北信義店和竹北店，請問您想了解哪一間呢？😊」**先不要呼叫工具**。
+                · 客人**已指明**（台北 / 信義，或 竹北）→ 呼叫 search_clinics_info(treatment_name="診所", category="<分店><主題>")，
+                  例：「台北怎麼停車」→ search_clinics_info("診所", "台北停車")；「竹北在哪」→ search_clinics_info("診所", "竹北地址")；
+                     「信義店看診時間」→ search_clinics_info("診所", "台北看診時間")。
+                · 工具回傳內容若含圖片網址（「圖片: https://...」）→ **務必把該網址原樣保留在回覆中**，不可刪掉。
             - 如果使用者問「初診費、諮詢檢測費、第一次來多少」→ 使用 `search_clinics_info`
-            - 如果使用者問「療程體驗價、某療程多少錢、單次多少」→ 從 SystemMessage [費用資訊] 找 price，**同時也呼叫 search_clinics_info(treatment_name, "初診")** 取得初診詳情，兩者整合回客人。
+            - 如果使用者問「療程體驗價、某療程多少錢、單次多少」→ **呼叫 get_treatment_fee(療程名)** 取得體驗價，**同時也呼叫 search_clinics_info(treatment_name, "初診")** 取得初診詳情，兩者整合回客人。
+            - ⭐ 如果使用者問「**體驗多久 / 做多久 / 療程多久 / 幾分鐘 / 時長**」→ **視同問費用**：
+              呼叫 `get_treatment_fee(療程名)`，把工具回傳的**療程名稱與價格原樣一起回覆**——
+              名稱括號內本來就含體驗時間（例如「SIS 科技深層精雕(15分鐘)」「NEO-熱磁減脂(30分鐘) + SIS(15分鐘)」），
+              客人看名稱就知道時間。
+              ⚠️ **不要自己從名稱裡挑數字出來重述**（組合方案容易張冠李戴，把 SIS 講成 30 分鐘），原樣帶出名稱即可。
+              ⚠️ 若工具查不到該療程 → 誠實說明需由專人確認，**不可自己編時間**。
+              ⚠️ 「多久**有效** / 多久**看到效果** / 多久會有感」**不屬此類**（那是療程問答），不要用費用回答。
+
+            - ⭐ 如果使用者問「**這個方案幾次 / 幾堂 / 包含幾次 / 5999 是幾次**」（在問**方案內容**）
+              → 呼叫 `search_clinics_info(treatment_name="診所", category="堂數")` 取得**官方固定答案**，
+                 若上文有指名療程，可同時呼叫 `get_treatment_fee(療程名)` 帶出該方案的名稱與價格，兩者整合回覆。
+                 ⚠️ 堂數說法**一律以工具回傳為準**，不可自己推論或改寫成別的堂數。
+              ⚠️ 必須與「**做幾次才有效果 / 要做幾次會比較明顯 / 幾次有用 / 需要做幾次**」區分開——
+                 那是**療程效果建議**（屬療程問答，不由預約助理回答）。
+                 判斷方式：句中出現「**效果 / 有效 / 有用 / 明顯 / 才**」→ 就是問療效，
+                 **不要用費用回答**，交由療程諮詢流程處理。
+              💡 判斷輔助：句中若出現費用表裡的價格數字（例如「5999 療程幾次」），
+                 幾乎必定是在問「這個方案包含什麼」，屬**方案內容**。
+            - 如果使用者問「某療程有什麼活動 / 優惠 / 方案 / 檔期」（句中或上文已有指名療程）→ **視同問體驗價**：先帶出初診諮詢評估，再**呼叫 get_treatment_fee(療程名)** 報出該療程的體驗價方案，兩者整合回客人，**不要只回初診就停、也不要等客人追問「體驗價」才講**。
+            - 「療程專屬問答」（怎麼計算 / 單點雙點 / 會不會痛 / 效果如何 / 多久有效 / 幾次 / 修復期等）
+              **不屬於預約助理職責**（正確答案在療程問答庫 treatment_qa，由療程諮詢流程處理）
+              → 請**不要**用 search_clinics_info 硬答、也不要自己編。
+            - ⭐ 如果客人表示「**距離太遠 / 有點遠 / 我在（某縣市）/ 你們（某地）有沒有據點 / 其他地區有分店嗎**」
+              → **必須先呼叫** `search_clinics_info(treatment_name="診所", category="分店")`，
+                 以資料庫的固定答案回覆（目前只有台北與竹北、其它地區籌備中）。
+              ❌ **嚴禁**自己安慰式地想解法（例如提議「線上諮詢」「視訊諮詢」「到府服務」「宅配」），
+                 這些服務**我們沒有提供**，講了等於對客人做不存在的承諾。
+              ✅ 沒有該地區據點就照實說明，並歡迎客人日後到附近時再聯繫。
+
+            - 🚨 **不可發明服務（最高原則）**：只要是「我們可以為您安排 ○○」這類**服務性承諾**，
+              ○○ 必須是工具回傳內容或本 prompt 明列的既有服務（門診諮詢評估、療程體驗、預約）。
+              **任何工具沒回、prompt 沒寫的服務一律不可提**（線上／視訊諮詢、到府、宅配、外縣市看診…）。
+              不確定就說「這部分我幫您確認一下～稍後由專人為您說明 💕」，不要自行發揮。
+
             - 除費用問題外，回答時不要自己想像或延伸回答，只能根據工具回傳內容回答。
             - 諮詢評估只說「諮詢評估」，禁止主動加「免費」；諮詢是否收費由客人問起時用 search_clinics_info 查證。
             - 不要印出Thought, Action, PAUSE過程。
@@ -471,20 +978,22 @@ class DoctorAppointmentAgent:
                  2. **絕對不可以**用空字串、「初診」、「費用」這類**不含療程名**的字串當 treatment_name 呼叫工具
                     （會抓到第一筆條目，導致誤回腦波機 / EECP 等）
 
-            **B. 「某療程多少錢」、「體驗價」、「單次多少」、「療程費」**
+            **B. 「某療程多少錢」、「體驗價」、「單次多少」、「療程費」、「有什麼活動 / 優惠 / 方案 / 檔期」（句中或上文已指名療程）**
 
                必做的三個步驟（缺一不可）：
-               → 步驟 1: 從 [費用資訊] 找**所有 name 包含該療程關鍵字**的條目（可能多筆）
+               → 步驟 1: **呼叫 get_treatment_fee(療程名)** 取得該療程的體驗價（會回所有 name 含該療程的方案，可能多筆）
                → 步驟 2: **呼叫 search_clinics_info(treatment_name, "初診")** 取得初診詳情
-               → 步驟 3: **整合**回客人 — 先列**所有找到**的方案 + 價格，再介紹初診評估具體內容
+               → 步驟 3: **整合**回客人 — 先帶出初診諮詢評估的內容，接著**主動報出工具回傳的所有方案 + 價格**（體驗價）。
+                        ⚠️ 只要 get_treatment_fee 有回該療程的價格，就**一定要把體驗價講出來**，不可以只回初診就停、也不可以等客人再問一次「體驗價」才講。
+                        ⚠️ 價格**一律以 get_treatment_fee 回傳為準**，嚴禁自己從記憶或歷史對話編價。
 
-               [費用資訊] 中的條目有兩種型態，兩種都要會處理：
+               get_treatment_fee 回傳的條目有兩種型態，兩種都要會處理：
 
                ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                🟢 型態 1：單一療程（name 不含「+」）
                ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-               例如 [費用資訊] 有：「療程X(30分鐘) → A 元」
+               例如 get_treatment_fee 回傳：「療程X(30分鐘) → A 元」
 
                ✅ 客人問「療程X 多少？」 → 直接報「療程X 體驗價 NT$ A」，整合初診內容
 
@@ -494,7 +1003,7 @@ class DoctorAppointmentAgent:
 
                若 name 含「+」，那行 price 是**整套組合**的價，**絕對不可拆解**。
 
-               例如 [費用資訊] 有：「療程X + 療程Y → P 元」
+               例如 get_treatment_fee 回傳：「療程X + 療程Y → P 元」
 
                ❌ 客人問「療程X 多少？」→ 你回「療程X P 元」← 錯！P 是 X+Y 整套的價
                ❌ 客人問「療程Y 多少？」→ 你回「療程Y P 元」← 錯！同上
@@ -505,7 +1014,7 @@ class DoctorAppointmentAgent:
                🔵 兩種型態都有時：全部列出
                ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-               例如 [費用資訊] 同時有：
+               例如 get_treatment_fee 同時回：
                   「療程X(30分鐘) → A 元」（單做）
                   「療程X + 療程Y → P 元」（組合）
 
@@ -517,18 +1026,19 @@ class DoctorAppointmentAgent:
                    請問您想了解哪個方案？」
 
                檢查原則：
-               - 報出的 price 必須對應到 [費用資訊] 裡**完整的 name**
+               - 報出的 price 必須對應到 get_treatment_fee 回傳裡**完整的 name**
                - 不可以把「A + B → P 元」簡化成「A → P 元」
                - 客人問某療程 → 列出**所有 name 含該關鍵字**的條目（單做 + 組合都列）
                - 客人質疑「確定只有 X 嗎」→ 重新檢視 name 是否含「+」，誠實回答
-               - 在 [費用資訊] 找得到 → 一定有方案，**不可以說「沒有」或「找不到」**
+               - get_treatment_fee 找得到 → 一定有方案，**不可以說「沒有」或「找不到」**
                - **不管什麼情況，報完價必須附上初診評估內容**（步驟 2、3 不可省略）
 
             **C. 「費用？」、「多少錢？」這種模糊問法，未指定療程**
                1. 檢視上文有沒有提到特定療程
-               2. 有提到 → 反問「請問您是想了解剛剛提到的該療程的費用嗎？」
-               3. 沒提到 → 反問「請問是指哪個療程的費用呢？」
-               4. 嚴禁拿不在上文出現過的療程當例子套（如腦波機、紅光）
+               2. 上文只提到「一個」療程 → **直接走 B**：帶該療程名呼叫 get_treatment_fee 查價，先帶出初診諮詢評估、再主動報出該療程體驗價，**不要再反問**「請問是哪個療程」
+               3. 上文提到多個療程、無法判斷客人指的是哪一個 → 反問「請問您是想了解哪個療程的費用呢？」
+               4. 上文完全沒提到療程 → 反問「請問是指哪個療程的費用呢？」
+               5. 嚴禁拿不在上文出現過的療程當例子套（如腦波機、紅光）
 
             ---
 
@@ -543,7 +1053,7 @@ class DoctorAppointmentAgent:
             AI：呼叫 search_clinics_info(treatment_name="NEO", category="初診")
 
             使用者：NEO 跟冷凍合在一起多少？
-            AI：（從 [費用資訊] 找組合方案 + 呼叫 search_clinics_info("NEO", "初診") 取初診詳情，整合）
+            AI：（呼叫 get_treatment_fee("NEO") 取得組合方案 + 呼叫 search_clinics_info("NEO", "初診") 取初診詳情，整合）
                 「NEO 熱磁減脂搭配冷凍的組合有兩種方案：搭配冷凍單點 NT$ 15,999、搭配冷凍雙點 NT$ 18,999。
 
                  療程前我們會先為您安排【諮詢＋檢測評估】，會檢測：
@@ -609,20 +1119,22 @@ class DoctorAppointmentAgent:
             """
         booking_agent = create_react_agent(
             model=self.llm_model,
-            tools=[set_appointment, confirm_booking, search_clinics_info],
+            tools=[set_appointment, confirm_booking, search_clinics_info, get_treatment_fee],
             prompt=system_prompt,
         )
 
-        result = booking_agent.invoke(state)
+        # 只餵最近 10 輪給 booking agent（保留 [費用資訊] 等 SystemMessage）；state 完整歷史不變
+        trimmed_messages = trim_history(state["messages"], GEN_HISTORY_MSGS)
+        result = booking_agent.invoke({**state, "messages": trimmed_messages})
         answer = result["messages"][-1].content
 
-        print("🔍 Agent invoke result:", result)
         print('resulttttttttttttt', answer)
 
         # 偵測本輪有沒有呼叫 confirm_booking（客人已提供完整資訊 → 觸發 CallCS=2）
         # 注意：set_appointment 只是顯示表單，**不**觸發轉真人
         # 只看「本輪 agent 新產生的訊息」，避免歷史 tool call 誤觸發
-        n_input_messages = len(state["messages"])
+        # 切片基準用「餵進去的截短訊息數」，才能正確抓出 agent 新增的訊息
+        n_input_messages = len(trimmed_messages)
         new_messages = result["messages"][n_input_messages:]
         confirm_booking_called = any(
             tc.get("name") == "confirm_booking"
@@ -636,52 +1148,213 @@ class DoctorAppointmentAgent:
                     AIMessage(content=answer, name="booking_node")
                 ],
                 "booking_completed": confirm_booking_called,
+                # booking 內容（費用/初診/預約）來自確定性查表＋價格守門，跳過檢索式事實核對，
+                # 避免正確價格/初診/框架句被 faithfulness 誤判無依據而轉真人；語氣/合規清理照舊。
+                "skip_fact_check": True,
             },
         )
 
 
     def moderator_node(self, state: AgentState) -> Command[Literal['__end__']]:
         print("*****************called moderator node************")
-        
-        system_prompt = """
-        你是一位嚴格的醫療法規審查員與品質控管專家。
-        請檢查使用者提供的回答內容。
-        
-        你的任務：
-        1. 錯字修正：只修正明顯的拼寫錯誤（例如「NEOT」應修正為「NEO」）。⚠️警告：絕對不可將原本正確的產品名稱（例如：猛健樂、瘦瘦筆、週纖達等）隨意替換為其他的療程（如 EMBODY）。只有當你百分之百確定是拼字錯誤時才進行修正。
-        2. 法規與語氣修正：移除任何誇大療效、保證性字眼（例如：即時效果、一定會好、完全消除、治癒）。
-        3. 語言一致性：確保回答為流暢的繁體中文，不可中英夾雜（除了特定療程名稱如 NEO、EMBODY 外，其餘 fat、muscle 請翻譯為脂肪、肌肉）。
-        
-        回傳規則：
-        若有上述問題，請修正後回傳。
-        若沒有問題，請直接回傳原本的內容。
-        絕對不要加任何解釋、前言、後語，也不要加上「這是修改後的版本：」之類的字眼，只能回傳最終要給終端使用者的純文字。
-        """
-        
+
+        # 診所資訊已由 booking 原文直出（地址/門牌/電話 100% 來自 CSV）→ 完全不改寫，直接放行，
+        # 避免審查 LLM「修錯字」時動到門牌號碼。上一則 AI 訊息即為最終回覆。
+        if state.get("skip_moderation"):
+            print("[moderator] skip_moderation=True → 原文直通，不做任何改寫")
+            passthrough = ""
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, AIMessage):
+                    passthrough = msg.content
+                    break
+            return Command(update={
+                "force_handoff": False,
+                "trace": {
+                    "draft": passthrough,
+                    "final": passthrough,
+                    "grounding": [],
+                    "moderator": {
+                        "fact_check": False, "unsupported_facts": [],
+                        "force_handoff": False, "skip_moderation": True,
+                    },
+                },
+            })
+
         draft_content = ""
         for msg in reversed(state["messages"]):
             if isinstance(msg, AIMessage):
                 draft_content = msg.content
                 break
-                
-        messages_for_llm = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": draft_content}
-        ]
-        
-        response = self.llm_model.invoke(messages_for_llm)
-        final_content = response.content
-        
-        print("moderator_node original:", draft_content)
+
+        # 本輪 retriever 撈到的「事實來源」（療程介紹 / 療程問答…）。有內容才做事實核對。
+        # booking route（費用/初診/預約）設 skip_fact_check → 只做語氣/合規清理，不過檢索式 faithfulness。
+        grounded = grounded_content_var.get()
+        do_fact_check = bool(grounded) and not state.get("skip_fact_check")
+
+        # ── 共同規則：合規 / 語氣 / 語言（不論有沒有檢索內容都要做）──
+        base_rules = (
+            "1. 錯字修正：只修正明顯的拼寫錯誤（例如「NEOT」應修正為「NEO」）。"
+            "⚠️絕對不可將原本正確的產品名稱（例如：猛健樂、瘦瘦筆、週纖達等）隨意替換為其他療程"
+            "（如 EMBODY）。只有百分之百確定是拼字錯誤時才修正。\n"
+            "2. 法規與語氣：移除任何誇大療效、保證性字眼（例如：即時效果、一定會好、完全消除、治癒）。\n"
+            "3. 語言一致性：流暢的繁體中文，不可中英夾雜（療程名如 NEO、EMBODY 保留，"
+            "其餘 fat、muscle 請翻成脂肪、肌肉）。\n"
+            "4. 原封不動保留所有網址、圖片連結、Markdown、emoji 與換行格式。\n"
+        )
+
+        if do_fact_check:
+            # ── 有驗證的 citation 事實核對：LLM 標逐字出處 → 程式驗證出處存在 → 無依據就刪/轉真人 ──
+            final_content, force_handoff, unsupported = self._fact_check_and_clean(draft_content, grounded, base_rules)
+        else:
+            # 本輪沒檢索療程內容（純預約 / 問地址 / 閒聊）→ 只做合規/語氣/語言，用 mini
+            unsupported = []
+            system_prompt = (
+                "你是一位嚴格的醫療法規審查員與品質控管專家。請依下列規則檢查並修正回答內容，"
+                "若沒問題就原文回傳；只輸出最終要給客人的純文字，不要任何解釋或前後語。\n\n"
+                + base_rules
+            )
+            force_handoff = False
+            try:
+                response = self.moderator_model.invoke([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": draft_content},
+                ])
+                final_content = (response.content or "").strip() or draft_content
+            except Exception as e:
+                # 審查失敗（多半是 API 問題）→ 保留原草稿，並通知 backend 轉真人客服（最保守）
+                print(f"❌ [moderator] 審查失敗: {e} → force_handoff=True")
+                final_content = draft_content
+                force_handoff = True
+
+        print(f"moderator_node (fact_check={do_fact_check}) original:", draft_content)
         print("moderator_node final:", final_content)
-        
+
         return Command(
             update={
+                "force_handoff": force_handoff,
                 "messages": state["messages"] + [
                     AIMessage(content=final_content, name="moderator_node")
-                ]
+                ],
+                "trace": {
+                    "draft": draft_content,
+                    "grounding": sorted(grounded) if isinstance(grounded, set) else ([grounded] if grounded else []),
+                    "final": final_content,
+                    "moderator": {
+                        "fact_check": do_fact_check,
+                        "unsupported_facts": unsupported,
+                        "force_handoff": force_handoff,
+                    },
+                },
             }
         )
+
+    def _fact_check_and_clean(self, draft_content, grounded, base_rules):
+        """有驗證的 citation 事實核對，回傳 (final_content, force_handoff, unsupported_facts)。
+
+        1) LLM 抽出草稿裡的療程硬事實 + 逐字出處（quote），並同時輸出合規/語氣清理版（cleaned）。
+        2) 程式驗證：每條 quote 必須真的（去空白後）存在於【診所資料】——擋掉「引用造假」。
+        3) 有無依據的事實 → 二次改寫，把那幾條刪掉/中性化；若刪完已無法回答核心問題 → 轉真人。
+        """
+        sources = "\n\n---\n\n".join(sorted(grounded)) if isinstance(grounded, set) else str(grounded)
+
+        # 「本診所是否提供某療程」的依據不是介紹文裡的某句話，而是「該療程這輪從診所 DB 被合法檢索到」
+        # （記在 authorized_treatments_var）。把這份清單補成一行來源，否則「我們有提供 SIS」這種 claim
+        # 在只描述療程內容的介紹文裡找不到逐字出處，會被誤判無依據而砍掉、進而轉真人。
+        authorized = authorized_treatments_var.get() or set()
+        if authorized:
+            sources = "本診所有提供以下療程：" + "、".join(sorted(authorized)) + "\n\n---\n\n" + sources
+            # 修法 B：把本輪在談療程的「官方介紹原文」也補進事實來源。
+            # 情境：planner 沒走「介紹原文直出」而掉進一般檢索，且該輪只撈到某個窄問答時，
+            # AI 若用官方介紹內容描述療程（例如「冷凍減脂是一種非侵入性療程，透過冷凍…減少脂肪」），
+            # 會因該介紹原文不在來源池 → 被誤判無依據 → 二次改寫刪不掉核心 → 誤轉真人。
+            # 介紹原文本身即官方 CSV 事實，補進來源池可讓「合法的療程描述」通過核對；
+            # 不影響對捏造價格等真危險的攔截（價格不在介紹原文，且另有輸出端價格守門）。
+            intro_sources = [s for s in (get_treatment_intro(t) for t in sorted(authorized)) if s]
+            if intro_sources:
+                sources = sources + "\n\n---\n\n" + "\n\n---\n\n".join(intro_sources)
+
+        extract_prompt = (
+            "你是醫療法規審查員 + 事實核對員。針對【AI 草稿】輸出結構化結果：\n\n"
+            "1) facts：列出草稿裡所有『療程硬事實』——英文全名 / 縮寫意義 / 全稱、技術原理、"
+            "溫度 / 深度 / 時間 / 次數等數據、機器 / 品牌 / 廠商名、診所是否提供某療程。每一條給：\n"
+            "   - claim：該事實（用草稿原話）。\n"
+            "   - quote：從【診所資料】**逐字複製**一段能支持這條 claim 的原文（一字不改、含標點）；\n"
+            "     若【診所資料】裡找不到支持它的內容，quote 一律回空字串 \"\"（**嚴禁**自己生出處）。\n"
+            "   關懷、需求引導、推薦、預約引導等『非事實』內容不要列入 facts。\n\n"
+            "2) cleaned：把草稿做下列『合規 / 語氣 / 語言』清理後的版本，"
+            "但**療程事實本身先原封不動**（是否有依據交由後續程式驗證）：\n"
+            + base_rules +
+            "5. 關心語句、需求引導、推薦詢問、預約引導等非事實內容一律保留，語氣維持親切。\n\n"
+            f"【診所資料】\n{sources}"
+        )
+        try:
+            audit = self.moderator_fact_model.with_structured_output(ModeratorAudit).invoke([
+                {"role": "system", "content": extract_prompt},
+                {"role": "user", "content": draft_content},
+            ])
+        except Exception as e:
+            print(f"❌ [moderator] 事實核對抽取失敗: {e} → force_handoff=True")
+            return draft_content, True, []
+
+        cleaned = (audit.get("cleaned") or "").strip() or draft_content
+
+        # ── 程式驗證：quote 需能對應到【診所資料】（去空白後比對）。逐字命中直接過；
+        #    否則用涵蓋率模糊比對（quote 有多少比例的字依序對得上診所資料），放寬容忍模型「沒逐字照抄」，
+        #    減少誤刪；真瞎編的字對不上、涵蓋率低，照樣擋掉。門檻可調（越高越嚴）。──
+        FACT_MATCH_THRESHOLD = 0.7
+
+        def _norm(s):
+            return re.sub(r"\s+", "", s or "")
+
+        grounded_norm = _norm(sources)
+
+        def _supported(quote):
+            q = _norm(quote)
+            if not q:
+                return False
+            if q in grounded_norm:   # 逐字命中 → 直接過（最快、最可靠）
+                return True
+            sm = SequenceMatcher(None, q, grounded_norm, autojunk=False)
+            covered = sum(b.size for b in sm.get_matching_blocks())
+            return covered / len(q) >= FACT_MATCH_THRESHOLD
+
+        unsupported = [
+            (f.get("claim") or "").strip()
+            for f in (audit.get("facts") or [])
+            if not _supported(f.get("quote"))
+        ]
+        unsupported = [c for c in unsupported if c]
+
+        if not unsupported:
+            print("[moderator] 療程事實全部驗證通過（逐字出處均存在）")
+            return cleaned, False, []
+
+        print(f"[moderator] 無依據事實 {len(unsupported)} 條 → 二次改寫刪除：{unsupported}")
+        rewrite_prompt = (
+            "以下【內容】中，這幾條『療程事實』經查證**沒有依據**，請處理：\n"
+            + "\n".join(f"- {c}" for c in unsupported) +
+            "\n\n規則：\n"
+            "1. 把上面每一條沒依據的事實從內容中刪掉，或改成不提及該細節的中性說法"
+            "（例如「這部分我幫您確認一下～稍後由專人為您說明」）；**嚴禁**自己補上正確答案。\n"
+            "2. 其餘有依據的內容、關懷、推薦、預約引導、網址 / 圖片連結、emoji、換行一律**原樣保留**。\n"
+            "3. 若刪掉這些事實後，剩下的內容**已無法回答客人本來問的核心問題**，"
+            "請**只輸出這一行**：[[HANDOFF]]（前後不要有任何其他字）。\n"
+            "只輸出最終要給客人的純文字，不要任何解釋。"
+        )
+        try:
+            resp = self.moderator_fact_model.invoke([
+                {"role": "system", "content": rewrite_prompt},
+                {"role": "user", "content": cleaned},
+            ])
+            out = (resp.content or "").strip()
+        except Exception as e:
+            print(f"❌ [moderator] 二次改寫失敗: {e} → force_handoff=True")
+            return draft_content, True, unsupported
+
+        if "[[HANDOFF]]" in out:
+            print("[moderator] 刪除無依據事實後已無法回答核心問題 → 轉真人")
+            return draft_content, True, unsupported
+        return (out or cleaned), False, unsupported
 
     def workflow(self):
         # 註解掉舊的 memory saver
@@ -713,119 +1386,3 @@ class DoctorAppointmentAgent:
         return self.app
     
 
-    # def workflow(self):
-    #     memory = MemorySaver()
-    #     self.graph = StateGraph(AgentState)
-
-    #     self.graph.add_node("supervisor", self.supervisor_node)
-    #     self.graph.add_node("information_node", self.information_node)
-    #     self.graph.add_node("booking_node", self.booking_node)
-
-    #     self.graph.add_edge(START, "supervisor")
-    #     self.graph.add_edge("supervisor", "information_node")
-    #     self.graph.add_edge("supervisor", "booking_node")
-    #     self.graph.add_edge("information_node", "supervisor")
-    #     self.graph.add_edge("booking_node", "supervisor")
-    #     self.graph.add_edge("supervisor", END)
-
-    #     self.app = self.graph.compile(checkpointer=memory)
-    #     return self.app
-
-
-            #     你是一位專業且有同理心的醫美諮詢助理，使用者會輸入症狀或需求，例如「我失眠很嚴重」、「我最近痘痘變多」。
-
-            # 你工作的流程是個循環，包含以下階段：
-            
-
-            # - Thought：根據目前資訊，思考如何幫助使用者。
-            # - Action (Pause)：選擇並執行一個可用工具，等待工具結果回傳。
-            # - Observation：根據工具回覆，整合資訊準備下一輪思考。
-            # - Answer：請直接給出回答，並結束對話。
-
-            # 你可以使用的行動工具包括：
-            # - get_empathy_questions_by_symptom：取得針對使用者症狀的同理話語和追問句。
-            # - search_clinics_by_keyword：查詢並推薦適合的醫美療程。
-
-            # 使用規則：
-            # - 每一回合最多呼叫一個工具。
-            # - 建議先用 get_empathy_questions_by_symptom，同理關心並追問，直到收集足夠資訊。
-            # - 若使用者明確表達想知道療程推薦，可直接呼叫 search_clinics_by_keyword。
-
-            # 請依照上述流程循環執行，直到你能完整回覆使用者需求。
-
-            # 現在開始回答使用者的問題：
-
-
-    # def booking_node(self, state: AgentState) -> Command[Literal['supervisor']]:
-    #     print("*****************called booking node************")
-        
- 
-    #     system_prompt = """
-    #         你是一位專業的療程預約員，使用者會輸入想要預約的日期和時間，例如「我想預約8/5痘痘」、「我想預約明天」，或是查詢可預約的時間，例如「7/22可以預約的時段」、「明天可以的時段」。
-
-    #         You run in a loop of Thought, Action, PAUSE, Observation.
-    #         At the end of the loop you output an Answer
-    #         Use Thought to describe your thoughts about the question you have been asked.
-    #         Use Action to run one of the actions available to you - then return PAUSE.
-    #         Observation will be the result of running those actions.
-
-    #         請注意：
-
-    #         - 所有日期必須輸出成 MM-DD-YYYY 格式，月份放前面，若日期或月份小於10，請補零，例如 8月7日 ➜ 08-07-2025。
-    #         - 請依使用者輸入，靈活調用工具，並且每次最多呼叫一個工具。
-
-    #         你可以使用的行動工具包括：
-
-    #         - check_availability: 確認可以預約的時間
-    #         - set_appointment: 預約療程
-    #         - cancel_appointment: 取消預約
-    #         - reschedule_appointment: 療程改期
-
-    #         請依上述流程循環執行，直到能完整回覆使用者的預約需求。
-
-    #         現在開始回覆使用者的問題：
-    #         """
-    #     booking_agent = create_react_agent(model=self.llm_model, tools=[check_availability, set_appointment, cancel_appointment, reschedule_appointment], prompt=system_prompt)
-
-    #     # print("🔍 booking_agent:", booking_agent)
-
-    #     result = booking_agent.invoke(state) # 這裡 result["messages"] 包含了代理的輸出和可能的工具調用結果
-
-    #     # print("🔍 Agent invoke result:", result)
-
-
-    #     final_booking_message_content = "我已處理您的預約請求。請問還有其他需要嗎？" # 預設結束語
-    #     booking_completed = False  # 新增完成標記
-    #     should_terminate = False #7/16新增終止標記
-    #     if result and "messages" in result:
-    #         for msg in reversed(result["messages"]):
-    #             # 終止條件1: 代理明確返回成功消息
-    #             if isinstance(msg, AIMessage):
-    #                 if any(keyword in msg.content for keyword in ["可預約的時間", "預約成功", "已完成", "取消成功", "已修改"]):
-    #                     booking_completed = True
-    #                     should_terminate = True
-    #                 final_booking_message_content = msg.content
-    #                 break 
-    #             # 終止條件2: 工具返回成功結果
-    #             elif isinstance(msg, HumanMessage) and msg.name == "tool_output":
-    #                 if any(keyword in msg.content for keyword in ["Successfully", "成功", "完成", "已更新"]):
-    #                     booking_completed = True
-    #                     should_terminate = True
-    #                 final_booking_message_content = f"預約已處理：{msg.content}. 還有其他需要嗎？"
-    #                 break
-
-    #             # 終止條件3: 檢測到錯誤或無法處理
-    #             elif isinstance(msg, AIMessage) and any(keyword in msg.content for keyword in ["無法處理", "錯誤", "失敗"]):
-    #                 should_terminate = True
-    #                 break
-
-    #     return Command(
-    #         update={
-    #             "messages": state["messages"] + [
-    #                 AIMessage(content=final_booking_message_content, name="booking_node")
-    #             ],
-    #             "booking_completed": booking_completed,
-    #             "should_terminate": should_terminate  # 新增狀態
-    #         },
-    #         goto="supervisor",
-    #     )

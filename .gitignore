@@ -24,5 +24,9 @@ line_chats_batch_10.csv
 line_chats_batch_11.csv
 line_chats_batch_12.csv
 chroma_qa/
+chroma_clinic_qa/
+chroma_treatment_qa/
+bm25_clinic_qa.pkl
+bm25_treatment_qa.pkl
 chroma_token_split/
 utils/chroma_qa/

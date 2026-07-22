@@ -13,12 +13,20 @@ OPENAI_API_KEY=os.getenv("OPENAI_API_KEY")
 os.environ["OPENAI_API_KEY"]=OPENAI_API_KEY
 
 class LLMModel:
-    def __init__(self, model_name="gpt-4.1-mini-2025-04-14"):
+    """
+    temperature 預設 0：本專案多數用途是「判斷/分類」（路由、planner、守門、審查、事實核對），
+    這類任務不需要創意，設 0 可大幅降低同一輸入產生不同判斷的抽風情形。
+    僅「客服回覆生成（Composer）」會刻意調高一點，保留一些自然語感。
+    ⚠️ 不傳 temperature 時 ChatOpenAI 不會送這個參數 → 套用 OpenAI 預設 1.0（最大隨機性），
+       因此這裡一律顯式指定，不要改回省略。
+    """
+    def __init__(self, model_name="gpt-4o", temperature: float = 0):
         if not model_name:
             raise ValueError("Model is not defined.")
         self.model_name = model_name
-        self.openai_model=ChatOpenAI(model=self.model_name)
-        
+        self.temperature = temperature
+        self.openai_model = ChatOpenAI(model=self.model_name, temperature=self.temperature)
+
     def get_model(self):
         return self.openai_model
 
