@@ -1,0 +1,142 @@
+# ─────────────────────────────────────────────────────────────
+# 回歸測試題庫（golden set）
+#
+# 每題 = 一個「客人問話 + 預期答對的特徵」。改完 code 跑 pytest，紅的就是回歸。
+# ⚠️ 只放「AI 目前確實答對」的題（已用 replay 確認過），這樣才是有效基準。
+#
+# input:
+#   content:          客人這一句（必填）
+#   message_history:  之前的對話，由「舊到新」自然順序寫；客服句加 "[真人客服] " 前綴（選填）
+#   ad_referral:      廣告來源關鍵字，只在 message_history 為空（首次對話）時對 AI 生效（選填）
+#
+# expect（只驗有寫的欄位）:
+#   call_cs / handoff_reason / prices_present / prices_absent /
+#   text_contains / text_contains_any / text_not_contains /
+#   images_include_any / images_empty
+# ─────────────────────────────────────────────────────────────
+
+# 【1】SIS 問價 → 上下文在談 SIS，客人問「價格」要正確報 1888，且不可冒出別療程的價
+- name: SIS_問價_報1888
+  input:
+    ad_referral: "SIS 科技深層精雕"
+    message_history:
+      - { type: human, content: "想了解「SIS 科技深層精雕」" }
+      - { type: ai,    content: "[真人客服] 現在越來越多人選擇【被動式深層訓練】，強化核心、提升肌肉張力。簡單了解一下：目前年齡大約在？想針對哪方面改善？" }
+      - { type: human, content: "32 肚子腰" }
+      - { type: ai,    content: "[真人客服] 可以把 SIS 科技深層精雕當成你的「專屬智能教練」，運用聚焦超磁能 HIFEM 技術。之前有做過相關療程 或是實際諮詢檢測評估了解呢？" }
+    content: "有做過療程沒有做過評估，價格"
+  expect:
+    call_cs: 0
+    prices_present: [1888]
+    # 9999 是「NEO + SIS 組合」的合法價（SIS 也在該組合裡），故不列入禁止；
+    # 5999/8999(冷凍)、16800(EMFACE) 與 SIS 無關，仍不可出現。
+    prices_absent: [5999, 8999, 16800]
+
+# 【2】防捏價（EMFACE 版）：客人問「16800 之後的價格」，真人也沒報後續價
+#      → AI 不可自己編後續價，也不可冒出別療程的價（5999/8999/9999/1888）。
+#      （不驗「有沒有複述 16800」——AI 回「只能提供體驗價、後續請洽診所」也是正確行為，屬彈性回覆）
+- name: EMFACE_問後續價_不可亂報價
+  input:
+    ad_referral: "EMFACE 菲斯波"
+    message_history:
+      - { type: human, content: "請問50歲做這個也有效果嗎？" }
+      - { type: ai,    content: "[真人客服] 可以的，我們客戶也有 60-70 歲的唷。目前有想改善哪些臉部狀況呢？" }
+      - { type: human, content: "沒有" }
+      - { type: ai,    content: "[真人客服] ✨限時體驗價 $16,800✨ EMFACE 菲斯波（多層次拉提）＋PBM 紅光導入 x1＋修護面膜 x2。首次諮詢評估請預留約 1~2 小時。" }
+    content: "體驗價16800，那之後價格多少？"
+  expect:
+    call_cs: 0
+    prices_absent: [5999, 8999, 9999, 1888]
+
+# 【3】防捏價：問「3次多少錢」，真人也沒報3次總價 → AI 不可自己乘出 17,997
+- name: 冷凍_問3次總價_不可捏造
+  input:
+    ad_referral: "冷凍減脂"
+    message_history:
+      - { type: human, content: "想了解「小腹斷捨離5999」" }
+      - { type: ai,    content: "[真人客服] 運用 -10°C 冷脈衝技術…目前想針對哪方面改善？" }
+      - { type: human, content: "要幾次？" }
+      - { type: ai,    content: "[真人客服] 一次能感覺…若脂肪較厚建議 2～3 次以上" }
+    content: "3次要多少錢？"
+  expect:
+    call_cs: 0
+    text_not_contains: ["17,997", "17997"]
+
+# 【4】問「新竹有嗎」→ 要給竹北店（地址來自 CSV，最該守住）
+- name: 冷凍_問新竹分店_給竹北
+  input:
+    ad_referral: "冷凍減脂"
+    content: "請問新竹有嗎？"
+  expect:
+    call_cs: 0
+    text_contains: ["竹北"]
+
+# 【5】介紹某療程不可誤轉真人（守住「修法 B」）：
+#      情境仿 production —— 前一輪聊過冷凍的窄問答（會不會復胖），這輪客人要「介紹一下冷凍」。
+#      修法 B 前：AI 的通用介紹在窄問答裡找不到出處 → 被查核當幻覺 → 誤轉真人（CallCS=1）。
+#      修法 B 後：療程介紹原文已補進查核來源 → 正常介紹、不轉真人。
+- name: 介紹冷凍_不可誤轉真人
+  input:
+    message_history:
+      - { type: human, content: "冷凍減脂做完會不會復胖？" }
+      - { type: ai,    content: "[真人客服] 科學角度來說，被冷凍凋亡的脂肪細胞不會再生，但如果過度暴飲暴食，新脂肪還是會長出來。" }
+    content: "你可以多介紹一下冷凍嗎"
+  expect:
+    call_cs: 0
+    handoff_reason: null
+
+# 【6】客人已給年齡+症狀 → 直接推薦、不可再問年齡（守住「同理短路確定性防呆」）：
+#      客人回覆含數字（年齡）時，不再發關懷罐頭重問年齡，直接依症狀推薦療程。
+- name: 給年齡症狀_直接推薦不重問年齡
+  input:
+    ad_referral: "EMFACE 菲斯波"
+    message_history:
+      - { type: human, content: "想了解無痕雙效拉提" }
+      - { type: ai,    content: "[真人客服] 老化不只是表層紋路，底層肌肉也在流失，這才是臉型往下走的原因。" }
+    content: "40+ 法令紋"
+  expect:
+    call_cs: 0
+    text_contains_any: ["Emface", "菲斯波", "電波"]
+    text_not_contains: ["年齡大約在哪", "幾歲"]
+
+# 【7】問「體驗多久」→ 視同問費用，原樣回含分鐘的療程名稱（時長就在費用 name 裡）。
+#      修正前：booking 認為時長不屬職責 → 回「不在服務範疇」；information 路徑則誤判幻覺轉真人。
+- name: 問體驗多久_回含分鐘的費用
+  input:
+    ad_referral: "SIS 科技深層精雕"
+    message_history:
+      - { type: human, content: "想了解「SIS 科技深層精雕」" }
+      - { type: ai,    content: "[真人客服] 可以把 SIS 科技深層精雕當成你的專屬智能教練。之前有做過相關療程嗎？" }
+      - { type: human, content: "有做過療程沒有做過評估，價格" }
+      - { type: ai,    content: "[真人客服] SIS 科技深層精雕體驗價 1,888 元。" }
+    content: "體驗多久"
+  expect:
+    call_cs: 0
+    text_contains_any: ["15分鐘", "15 分鐘"]
+    text_not_contains: ["不在預約助理", "服務範疇"]
+
+# 【8】收費初診絕不可說「免費」（涉及金錢承諾，最高風險）：
+#      consult_plan.csv 中 腦波機/EECP/PBM紅光/NightLase 的 consult_free=否，
+#      初診為 方案一 $4,800 / 方案二 $1,000；講成免費等於對客人做錯誤承諾。
+#      （對照組：Emface/EMBODY/NEO/冷凍/SIS/瘦瘦筆 的初診 consult_free=是，說免費才是對的）
+- name: 腦波機初診_收費不可說免費
+  input:
+    content: "腦波機初診多少錢？"
+  expect:
+    call_cs: 0
+    prices_present: [4800, 1000]
+    text_not_contains: ["免費"]
+
+# 【9】客人嫌遠 → 用分店固定答案，且**絕不可發明不存在的服務**：
+#      修正前：booking 沒呼叫工具就自己安慰式發揮，憑空承諾「線上諮詢」（診所根本沒這服務），
+#              且因 grounding 為空，事實查核整個沒跑 → 幻覺零阻攔通過。
+- name: 客人嫌遠_給分店固定答案不可發明服務
+  input:
+    message_history:
+      - { type: human, content: "你們在哪？" }
+      - { type: ai,    content: "[真人客服] 我們霍普金斯診所竹北店：新竹縣竹北市莊敬南路150號1樓，營業時間週一到週六 11:15~20:00。" }
+    content: "因為我在台南有點遠欸"
+  expect:
+    call_cs: 0
+    text_contains: ["台北", "竹北"]
+    text_not_contains: ["線上諮詢", "視訊", "到府"]

@@ -1,12 +1,12 @@
 [tool.poetry]
-name = "line-clinics-agent"
+name = "fb-clinics-agent"
 version = "0.1.0"
 description = ""
 authors = ["Vita Huang <bexo@gastom.com.tw>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "3.11.0"
+python = ">=3.11,<3.12"
 streamlit = "^1.46.1"
 langgraph = "0.2.70"
 numpy = "1.26.4"
@@ -26,12 +26,16 @@ langchain-openai = "0.3.16"
 langsmith = "0.3.33"
 line-bot-sdk = "^3.18.1"
 mysql-connector-python = "^9.4.0"
-easyocr = "^1.7.2"
 scikit-learn = "^1.8.0"
+langgraph-checkpoint-sqlite = "2.0.11"
+langgraph-checkpoint-postgres = "^3.0.5"
+pandoc = "^2.4"
+pypandoc = "^1.17"
 
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^7.1.0"
+pytest = "^9.1.1"
 
 [build-system]
 requires = ["poetry-core"]

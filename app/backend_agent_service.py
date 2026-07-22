@@ -113,11 +113,9 @@ def determine_additional_images(ai_reply: str, user_query: str, extracted_urls: 
         ])
 
 
-    # 3. 停車場/地址相關
-    elif any(kw in ai_reply for kw in ["地址", "地點", "位於"]) or \
-         any(kw in user_query for kw in ["哪裡", "停車", "停車場", "開車"]):
-        additional_images.append("https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/parking_lots.jpg")
-        
+    # 停車 / 地址圖：不再寫死單一圖。兩間分店（台北 / 竹北）的停車圖已分別嵌在 clinic_qa
+    # 答案裡（「圖片: https://...png」），由上游 extract_image_urls 從回覆文字自動抓出，
+    # 這裡不再處理，避免貼到錯的分店或過期的圖。
 
     # 3. 療程相關（使用 API 取得對應圖片取代 if-elif）
     else:
@@ -207,6 +205,9 @@ CS_KEYWORDS = [
     "專人", "轉接", "轉人工", "真人服務", "要真人",
     "客訴", "投訴", "抱怨", "退費", "退錢", "退款",
     "醫療糾紛", "申訴",
+    # 取消 / 改約 → 交給真人客服處理（用較完整片語，避免「取消」單字誤判其他句子）
+    "取消預約", "取消約", "取消約診", "取消我的預約",
+    "改約", "改預約", "改時間", "改期", "更改預約", "更改時間", "重新預約",
 ]
 
 
@@ -221,13 +222,51 @@ TREATMENT_KEYWORDS = [
 ]
 
 
-def identify_treatments_from_context(user_query: str, message_history: list) -> list:
+def _treatment_tokens_from_fees(treatment_fees: list) -> list:
+    """
+    從 DB 費用 name 拆出可比對的療程詞，讓**新增到費用 DB 的療程不必手動補進
+    TREATMENT_KEYWORDS** 也能被費用 pre-filter 命中（混合策略：DB 為主、清單補同義詞）。
+
+    - 拆「+」組合（「NEO + 冷凍單點」→ NEO、冷凍單點）
+    - 先去括號規格（「冷凍減脂(60分鐘-單點)」→「冷凍減脂」），再去方案/規格用詞，還原成原子療程詞
+    - 過濾單字元，避免拆出太短的詞造成誤命中
+
+    ⚠️ 拆出的詞會被 filter_fees_by_treatments 拿去對 fee name 做**子字串**比對，
+       所以必須保證是原始 name 的乾淨子字串：只去括號規格與頭尾標點，
+       **不可**清掉詞內連字（如「NEO-熱磁減脂」），否則反而對不回原始 name。
+       （曾出過 bug：只去 option 詞、沒去括號 → 拆出「冷凍減脂(60分鐘-)」對不到任何 fee name → relevant_fees 空掉）
+    """
+    tokens = set()
+    for f in treatment_fees or []:
+        name = (getattr(f, "name", "") or "").strip()
+        if not name:
+            continue
+        for part in name.split("+"):
+            t = part.strip()
+            t = re.sub(r"[（(][^）)]*[）)]", "", t)   # 先整段去掉括號內規格（如「(60分鐘-單點)」）
+            for w in _OPTION_WORDS:
+                t = t.replace(w, "")
+            t = t.strip(" -–—~、,，.。/·")             # 只清頭尾標點/破折號，保留詞內連字
+            if len(t) >= 2:
+                tokens.add(t)
+    return sorted(tokens)
+
+
+def identify_treatments_from_context(
+    user_query: str, message_history: list, treatment_fees: list = None
+) -> list:
     """
     用 LLM 從「本輪訊息 + 歷史對話」判斷客人在問哪些療程（處理代名詞「這個」「那個」）。
-    回傳的療程名必須是 TREATMENT_KEYWORDS 裡的，方便後續 dict 比對。
+    回傳的療程名必須在「比對詞庫」內，方便後續 dict 比對。
+
+    比對詞庫 = 手寫 TREATMENT_KEYWORDS（含同義詞/中英對照/組合拆詞）
+              ∪ DB 費用名稱拆出的療程詞（新增療程自動納入，不必改程式碼）。
     """
+    # 比對詞庫：手寫清單 ∪ DB 費用名稱拆出的詞（去重、保序）
+    keyword_pool = list(dict.fromkeys(TREATMENT_KEYWORDS + _treatment_tokens_from_fees(treatment_fees)))
+
     # 先做快速 keyword 比對（如果本輪訊息直接命中就不用打 LLM）
-    direct_hits = [kw for kw in TREATMENT_KEYWORDS if kw.lower() in user_query.lower()]
+    direct_hits = [kw for kw in keyword_pool if kw.lower() in user_query.lower()]
     if direct_hits:
         print(f"[fee filter] Direct keyword match: {direct_hits}")
         return direct_hits
@@ -253,7 +292,7 @@ def identify_treatments_from_context(user_query: str, message_history: list) -> 
         f"客人最新訊息：{user_query}\n\n"
         f"從以下清單挑出「客人這句話實際指向的療程」"
         f"（不是主題相關的全部，逗號分隔，沒有就回 NONE）：\n"
-        f"{', '.join(TREATMENT_KEYWORDS)}"
+        f"{', '.join(keyword_pool)}"
     )
     try:
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -262,8 +301,8 @@ def identify_treatments_from_context(user_query: str, message_history: list) -> 
         if not text or text.upper() == "NONE":
             return []
         parsed = [t.strip() for t in text.split(",") if t.strip()]
-        # 過濾掉 LLM 亂造的（不在 TREATMENT_KEYWORDS 裡的）
-        valid = [t for t in parsed if t in TREATMENT_KEYWORDS]
+        # 過濾掉 LLM 亂造的（不在比對詞庫裡的）
+        valid = [t for t in parsed if t in keyword_pool]
         print(f"[fee filter] LLM context match: {valid}")
         return valid
     except Exception as e:
@@ -285,96 +324,93 @@ def filter_fees_by_treatments(treatments: list, treatment_fees: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────
-# 療程幻覺檢查：以 search_clinics_by_keyword 的 retriever 結果為合法依據
-# AI 回覆裡提到的療程，只要不在合法清單就視為幻覺
+# 輸出端「價格守門」：pre-filter 只洗乾淨 [費用資訊]，洗不掉對話歷史裡別的療程殘留價，
+# AI 仍可能把歷史中「別的療程的真實價」套到本療程頭上（跨療程張冠李戴）。
+# 這裡對「最終回覆」再驗一次：抓出所有價格 → 若某價是「別的療程的真實價、卻不在本療程合法價內」
+# → 判定捏造，讓 AI 帶著正確價重寫一次；重寫後仍錯（或無法回答）才轉真人。
 # ─────────────────────────────────────────────────────────────
-from toolkit.toolkits import authorized_treatments_var, TREATMENT_SYNONYMS
+
+# 只抓「像價格」的數字：NT$ 前綴、或帶千分位逗號（如 16,800）。
+# 「30分鐘」「6/25」「0912345678」不帶逗號也無 NT$ 前綴，不會被誤抓。
+_PRICE_RE = re.compile(r"(?:NT\$?|＄|\$)\s*([\d][\d,]*)|(\b\d{1,3}(?:,\d{3})+\b)")
+
+
+def _extract_prices(text: str) -> set:
+    """從文字抽出所有價格數字（去逗號後轉 int）。"""
+    out = set()
+    for m in _PRICE_RE.finditer(text or ""):
+        raw = (m.group(1) or m.group(2) or "").replace(",", "")
+        if raw.isdigit():
+            out.add(int(raw))
+    return out
+
+
+def _resolve_reply_treatments(text: str) -> list:
+    """從 AI 回覆本身掃出提到的療程（用 TREATMENT_SYNONYMS），回傳可供 filter_fees 比對的別名清單。
+    命中某別名就把整組別名都放進來（fee 表 name 可能用組內另一種寫法），去重保序。
+
+    用途：fee filter 對序數／代名詞（如「第一個療程」）解析失敗、relevant_fees 空掉時，
+    改以「AI 回覆實際在講的療程」回頭查真表，讓價格守門的偵測與重寫都有正確依據。
+    """
+    low = (text or "").lower()
+    hits = []
+    for group in TREATMENT_SYNONYMS:
+        if any(alias.lower() in low for alias in group):
+            hits.extend(group)
+    return list(dict.fromkeys(hits))
+
+
+def _format_fee_lines(fees: list) -> str:
+    return "\n".join(
+        f"- {f.name}：NT$ {f.price:,}"
+        + ("（組合方案整套價）" if "+" in f.name else "（單做價）")
+        for f in fees
+    )
+
+
+def _rewrite_price_reply(draft: str, treatments: list, relevant_fees: list, leaked: set) -> str:
+    """帶著本療程正確價，讓 AI 重寫一次。無法在不編價下回答 → 回 [[HANDOFF]]。"""
+    allowed_txt = _format_fee_lines(relevant_fees) if relevant_fees else "（本療程目前無任何體驗價方案）"
+    t = " / ".join(treatments) if treatments else "客人詢問的療程"
+    sys = (
+        "你剛才給客人的回覆裡，報了『不屬於本療程』的價格——很可能是把對話歷史中「其他療程」的價格套了過來。\n"
+        f"本輪客人問的療程是：{t}。\n"
+        f"本療程真正、且唯一可用的體驗價如下：\n{allowed_txt}\n\n"
+        f"被判定錯誤的價格：{', '.join(f'NT$ {p:,}' for p in sorted(leaked))}\n\n"
+        "請重寫要給客人的回覆，規則：\n"
+        "1. 療程『體驗價』只能用上面列出的；被判定錯誤的價格必須移除或改正，**絕不可保留**。\n"
+        "2. 若上面顯示本療程沒有體驗價方案，就誠實說明目前沒有體驗價、可先預約諮詢評估，不要報任何體驗價。\n"
+        "3. 除了上面列出的體驗價，**不要生出任何新的療程價格數字**（初診/諮詢費等非體驗價資訊可照舊保留）。\n"
+        "4. 其餘關懷、推薦、預約引導、網址／圖片連結、emoji、換行一律原樣保留。\n"
+        "5. 若你無法在不編造價格的情況下回答客人本來的問題，**只輸出這一行**：[[HANDOFF]]（前後不要有任何其他字）。\n"
+        "只輸出最終要給客人的純文字，不要任何解釋。"
+    )
+    try:
+        llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=draft)])
+        return (resp.content or "").strip() or draft
+    except Exception as e:
+        print(f"[price guard] 重寫失敗: {e} → 維持原文、交由上層轉真人")
+        return "[[HANDOFF]]"
+
+
+# ─────────────────────────────────────────────────────────────
+# 療程幻覺檢查（faithfulness）：實際核對已移到 graph 的 moderator_node，
+# 以本輪 retriever 撈到的「原始內容」為唯一事實來源。
+# 這裡只負責在每個 request 開始時重設下列 context var（供 moderator 讀取）。
+# ─────────────────────────────────────────────────────────────
+from toolkit.toolkits import (
+    authorized_treatments_var,
+    grounded_content_var,
+    treatment_fees_var,
+    TREATMENT_SYNONYMS,
+    register_grounded_content,
+)
 
 
 # 方案/規格用詞 —— 這些是「同一療程的選項」，不是療程本身，抽取時要排除
 _OPTION_WORDS = ("單點", "雙點", "多點", "單次", "套裝", "組合", "方案", "堂", "部位", "療程方案")
 
-
-def extract_mentioned_treatments(text: str) -> list:
-    """用 gpt-4o-mini 抽出文字裡提到的所有療程名"""
-    prompt = (
-        "以下是醫美客服的回覆。請列出文中所有提到的「醫美療程名稱」"
-        "（只要療程名，不是部位、不是症狀、不是描述、不是檢測項目，"
-        "也**不是方案/規格**——例如「單點 / 雙點 / 單次 / 套裝 / 組合 / 堂數」是同一療程的選項，不要列）。"
-        "用逗號分隔。文中沒有療程就回 NONE。\n\n"
-        f"回覆：\n{text}"
-    )
-    try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        result = llm.invoke([HumanMessage(content=prompt)]).content.strip()
-        if not result or result.upper() == "NONE":
-            return []
-        candidates = [t.strip() for t in result.split(",") if t.strip()]
-        # 確定性過濾：把含方案/規格用詞的（如「單點治療」「雙點治療」）剔掉，避免誤判成幻覺療程
-        return [t for t in candidates if not any(w in t for w in _OPTION_WORDS)]
-    except Exception as e:
-        print(f"[sanitize] extract error: {e}")
-        return []
-
-
-def sanitize_ai_response(ai_text: str) -> tuple:
-    """
-    依 retriever 結果檢查 AI 回覆是否亂提療程。
-    回傳 (清理過的文字, 是否要觸發 CallCS=1)
-    """
-    authorized = authorized_treatments_var.get()
-    if not authorized:
-        # 本輪沒呼叫 search_clinics_by_keyword（例如客人問費用 / 預約）→ 跳過檢查
-        return ai_text, False
-
-    mentioned = extract_mentioned_treatments(ai_text)
-    if not mentioned:
-        return ai_text, False
-
-    # 比對：mentioned 裡有但 authorized 沒有的 = 幻覺
-    def _match(x: str, y: str) -> bool:
-        # 寬鬆比對：互為子字串就算命中（沿用原本行為，處理「腦波機療程」這種帶後綴的講法）
-        x, y = x.lower().strip(), y.lower().strip()
-        return bool(x) and bool(y) and (x in y or y in x)
-
-    def is_authorized(t: str) -> bool:
-        # 1) 直接比對這一輪 retriever 撈到的合法療程
-        if any(_match(t, a) for a in authorized):
-            return True
-        # 2) 別名比對：t 命中某個同義詞群組，且該群組有成員這輪真的被檢索到（grounding）
-        #    → 正確的學名/別名（如 腦波機↔DeepTMS）放行；AI 亂拼的名稱因為不在任何群組裡，照樣被擋
-        for group in TREATMENT_SYNONYMS:
-            if any(_match(t, s) for s in group) and any(
-                _match(s, a) for s in group for a in authorized
-            ):
-                return True
-        return False
-
-    unauthorized = [t for t in mentioned if not is_authorized(t)]
-    if not unauthorized:
-        return ai_text, False
-
-    print(f"⚠️ [sanitize] 偵測到不合規療程: {unauthorized}（合法清單: {authorized}）")
-
-    # 用 LLM 改寫，移除違規療程
-    rewrite_prompt = (
-        f"以下醫美客服回覆提到了我們診所**沒有**提供的療程：{', '.join(unauthorized)}\n"
-        f"我們**只有**這些療程可以推薦：{', '.join(sorted(authorized))}\n\n"
-        f"請改寫這段回覆：\n"
-        f"1. **完全移除**不存在的療程相關描述（連同其句子 / 段落一起刪）\n"
-        f"2. 只保留我們有的療程內容\n"
-        f"3. 結尾改成自然的引導句（例如「請問您對哪一個療程比較有興趣？」）\n"
-        f"4. 不要解釋你做了什麼修改，只輸出改寫後的內容\n\n"
-        f"原回覆：\n{ai_text}\n\n改寫後："
-    )
-    try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        cleaned = llm.invoke([HumanMessage(content=rewrite_prompt)]).content.strip()
-        print(f"✅ [sanitize] 改寫完成")
-        return cleaned, False
-    except Exception as e:
-        print(f"❌ [sanitize] 改寫失敗: {e} → 觸發 CallCS=1 轉真人")
-        return ai_text, True  # 改寫失敗 → 觸發轉真人
 
 def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
     """
@@ -398,6 +434,11 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
 
     # 重設本 request 的「合法療程」集合（由 search_clinics_by_keyword 動態累積）
     authorized_treatments_var.set(set())
+    # 重設本 request 的「事實來源」集合（由各 retriever 動態累積，供 sanitize faithfulness 核對）
+    grounded_content_var.set(set())
+    # 把「整張費用表」原封不動存入（不預先 filter）；由 booking 的 get_treatment_fee 工具
+    # 在認出療程的當下才 filter。取代舊的 graph 前弱解析預注入，避免代名詞/序數解析失敗導致編價。
+    treatment_fees_var.set(user_input.treatment_fees or [])
 
     app_graph = agent.workflow()
 
@@ -410,82 +451,15 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
         elif msg.type == "ai":
             langchain_messages.append(AIMessage(content=msg.content))
 
-    # ─── 注入療程費用 SystemMessage（pre-filter 防幻覺）───
-    # Step 1: LLM 看上下文找出客人問的療程
-    # Step 2: dict 比對 treatment_fees 過濾出對應行
-    # Step 3: 只把過濾後的行給 AI，AI 物理上看不到無關價格，無法 hallucinate
-    if user_input.treatment_fees:
-        user_query_for_filter = (user_input.content or "").strip()
-        mentioned_treatments = identify_treatments_from_context(
-            user_query_for_filter, user_input.message_history
-        )
-        relevant_fees = filter_fees_by_treatments(
-            mentioned_treatments, user_input.treatment_fees
-        )
-
-        common_rules = (
-            "重要規則：\n"
-            "1. 此區塊**只有療程體驗價**（實際做療程一次的費用）。\n"
-            "   「初診費 / 諮詢檢測費」請走 search_clinics_info 工具查詢，不要從這裡取。\n"
-            "2. 客人沒明確問價時，不要主動報價；先了解需求、推薦合適療程。\n"
-            "3. 報體驗價時，**必須同時呼叫 search_clinics_info(treatment_name, \"初診\")** "
-            "查詢該療程的初診詳情，整合回客人。\n"
-            "4. 組合療程（name 含 \"+\"）整筆對應一個總價，直接報整筆即可。\n"
-            "5. 檔期活動有時效性，講價格時可順帶提及但不硬推。\n"
-        )
-
-        if mentioned_treatments and not relevant_fees:
-            # 客人問了具體療程，但費用表完全沒對應行 → 明確告訴 AI 「沒有」
-            fee_note = (
-                f"[費用資訊] 客人本輪詢問的療程（{', '.join(mentioned_treatments)}）"
-                f"**目前沒有提供體驗價方案**。\n"
-                f"請直接回覆：「目前 {' / '.join(mentioned_treatments)} 沒有提供體驗價方案，"
-                f"可以先預約諮詢評估，由專人為您安排。」\n"
-                f"（注意：**不要主動說「免費」**。客人若問諮詢是否要錢，請呼叫 search_clinics_info 查初診/諮詢費再回答。）\n"
-                f"**嚴禁**自己編造價格，也**嚴禁**拿其他療程的價格套用上去。\n\n"
-                + common_rules
-            )
-            print(f"[fee filter] 客人問 {mentioned_treatments} 但 fees 無對應 → 告訴 AI 沒有方案")
-        elif relevant_fees:
-            # 有對應行 → 只注入這幾行。標註單做/組合，方便 AI 不要把組合拆開。
-            fee_lines = [
-                f"- {f.name}：NT$ {f.price:,}"
-                + ("（組合方案，整套價）" if "+" in f.name else "（單做價）")
-                for f in relevant_fees
-            ]
-            # 防呆：只要這次撈到的行裡有組合（name 含「+」），就補一條硬性禁止拆解的規則，
-            # 避免 AI 把「A + B = 總價」拆成 A、B 各自的單項價（會捏造數字）。
-            has_combo = any("+" in f.name for f in relevant_fees)
-            combo_guard = (
-                "\n\n🚨 **組合方案防呆（嚴格遵守）**：\n"
-                "- 上面標「組合方案」的那幾行，price 是**整套一起做**的總價，"
-                "**嚴禁**拆成單一療程或單一部位的價格。\n"
-                "- 例：「NEO + 冷凍單點 = 15,999」**不代表** NEO 單做 15,999，也**不代表**冷凍單點 15,999。\n"
-                "- 只能照上面**完整的 name 原樣報價**；上面沒列出的單做價就是**沒有**，"
-                "請回覆「該方案目前沒有單獨體驗價」，**嚴禁**自己換算或編造數字。\n"
-            ) if has_combo else ""
-            fee_note = (
-                "[費用資訊] 以下是客人本輪詢問療程的相關體驗價：\n"
-                + "\n".join(fee_lines)
-                + combo_guard
-                + "\n\n"
-                + common_rules
-            )
-            print(f"[fee filter] 注入 {len(relevant_fees)} 行相關費用"
-                  f"{'（含組合，已加防呆）' if has_combo else ''}")
-        else:
-            # 客人沒指定具體療程（例如問「有什麼優惠」「現在有什麼活動」）
-            # → 不要丟全表，直接請 AI 反問客人有興趣的方向
-            fee_note = (
-                "[費用資訊] 客人本輪問費用/優惠/活動，但**沒有指定特定療程**。\n"
-                "請反問客人：「我們有針對不同需求的療程方案，請問您比較想了解哪一塊？"
-                "例如體態雕塑、臉部緊緻、私密保養、睡眠改善等。」\n"
-                "**不要**主動列出全部療程或價格，等客人指定再給對應資訊。\n\n"
-                + common_rules
-            )
-            print(f"[fee filter] 客人未指定療程 → 請 AI 反問")
-
-        langchain_messages.insert(0, SystemMessage(content=fee_note))
+    # ─── 療程體驗價：已改為「工具化」，不再於 graph 前預注入 [費用資訊] ───
+    # 整張費用表已存入 treatment_fees_var（見上方）；booking 的 get_treatment_fee 工具會在
+    # 「認出療程的當下」才 filter，用 booking 的可靠解析取代舊的 graph 前弱解析預注入
+    # （舊做法對代名詞/序數會解析失敗、relevant_fees 空掉 → AI 沒價可用而編價）。
+    # 下面兩個變數保留空初始化，供輸出端「價格守門」引用（守門主要靠 reply_fees 從回覆回推真價）。
+    mentioned_treatments: list = []
+    relevant_fees: list = []
+    if not user_input.treatment_fees:
+        print("[fee filter] ⚠️ 本次 request 未帶 treatment_fees → get_treatment_fee 查不到任何體驗價")
 
     # 首次對話（無歷史）且有廣告來源 → 注入廣告 context 給 AI 當開場提示（放最前面）
     if not user_input.message_history and user_input.ad_referral:
@@ -540,6 +514,7 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
         "next": "",
         "query": "",
         "current_reasoning": "",
+        "trace": {},   # 各節點累積寫入的評估軌跡（LLM-as-judge 用）
     }
 
     # 執行 Agent（不使用 checkpointer，歷史由後端在 messages 內傳入）
@@ -558,8 +533,55 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
                 final_ai_message_content = msg.content
                 break
 
-    # 🛡️ 療程幻覺檢查 + 改寫（只在本輪呼叫過 search_clinics_by_keyword 時生效）
-    final_ai_message_content, sanitize_force_handoff = sanitize_ai_response(final_ai_message_content)
+    # 🛡️ 療程事實核對（faithfulness）已併入 graph 的 moderator_node：
+    #    moderator 本輪有檢索到療程內容時會用 gpt-4o 核對事實、修正無依據的描述；
+    #    核對失敗時回傳 force_handoff=True，這裡讀出來決定是否轉真人。
+    sanitize_force_handoff = bool(response.get("force_handoff", False))
+
+    # 🛡️ 輸出端價格守門：抓回覆裡的價格，若出現「別的療程的真實價、卻不在本療程合法價內」
+    #    （典型：把對話歷史裡別療程的價格套過來）→ 讓 AI 帶正確價重寫一次；第二次仍錯才轉真人。
+    price_guard_handoff = False
+    price_guard_trace = None
+    all_table_prices = {f.price for f in (user_input.treatment_fees or [])}
+    reply_prices = _extract_prices(final_ai_message_content)
+    # 合法價集合 = fee filter 注入的 relevant_fees ∪「AI 回覆實際提到的療程」回頭查表的真實 fees。
+    # 後者補救 fee filter 對序數／代名詞（如「第一個療程」）解析失敗、relevant_fees 空掉的情況：
+    # 直接從 AI 回覆認出療程（如冷凍減脂）查它的真實價 → 偵測不誤殺正確價、重寫也拿得到正確價。
+    reply_treatments = _resolve_reply_treatments(final_ai_message_content)
+    reply_fees = filter_fees_by_treatments(reply_treatments, user_input.treatment_fees)
+    guard_fees = []
+    _seen_fee = set()
+    for f in (relevant_fees + reply_fees):
+        key = (f.name, f.price)
+        if key not in _seen_fee:
+            _seen_fee.add(key)
+            guard_fees.append(f)
+    allowed_prices = {f.price for f in guard_fees}
+    leaked = (reply_prices & all_table_prices) - allowed_prices   # 屬別療程的真實價、非本療程合法價
+    if leaked:
+        print(f"[price guard] 偵測到不屬本療程的價格 {sorted(leaked)}"
+              f"（回覆療程={reply_treatments}｜合法價={sorted(allowed_prices)}）→ 讓 AI 重寫一次")
+        rewritten = _rewrite_price_reply(
+            final_ai_message_content,
+            (mentioned_treatments or reply_treatments),
+            guard_fees,
+            leaked,
+        )
+        leaked2 = (_extract_prices(rewritten) & all_table_prices) - allowed_prices
+        if "[[HANDOFF]]" in rewritten or leaked2:
+            print(f"[price guard] 第二次仍有問題（leaked={sorted(leaked2)}）→ 轉真人")
+            price_guard_handoff = True   # 維持原文，call_cs=1 時上層會清空 text
+        else:
+            print("[price guard] 重寫後價格正確 → 採用新回覆")
+            final_ai_message_content = rewritten
+        price_guard_trace = {
+            "leaked": sorted(leaked),
+            "allowed": sorted(allowed_prices),
+            "reply_treatments": reply_treatments,
+            "retried": True,
+            "resolved": (not price_guard_handoff),
+            "handoff": price_guard_handoff,
+        }
 
     # 提取 AI 回覆中的圖片 URL
     extracted_urls = extract_image_urls(final_ai_message_content)
@@ -571,6 +593,9 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
 
     # 療程幻覺改寫失敗 → 直接轉真人客服（最保守）
     if sanitize_force_handoff:
+        call_cs = 1
+    # 價格守門重寫兩次仍錯 → 轉真人
+    if price_guard_handoff:
         call_cs = 1
     user_query_lower = user_query.lower()
     if any(kw.lower() in user_query_lower for kw in CS_KEYWORDS):
@@ -595,12 +620,6 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
     clean_text = clean_text_from_urls(final_ai_message_content, extracted_urls)
     clean_text = strip_markdown(clean_text)   # 去 markdown 記號，讓 Messenger/LINE 顯示乾淨
 
-    # 【當確定有回傳停車圖片時，強制加上停車資訊】
-    parking_image = "https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/parking_lots.jpg"
-    if parking_image in all_images:
-        if "春光公園" not in clean_text:
-            clean_text = "🅿️ 停車資訊：可以到走5分鐘的永春停車場或是走8分鐘即可抵達的春光公園地下停車場。"
-
     # CallCS=1（客人主動找真人）→ 清空 text/images，純通知後端轉接
     # CallCS=2（預約流程）→ 保留 AI 的預約引導文字、清空 images，後端先發文字再通知客服
     # CallCS=0 → 正常回覆
@@ -610,16 +629,37 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
     elif call_cs == 2:
         all_images = []
 
+    # ─── 組裝 trace（LLM-as-judge 評估用）───
+    # graph 內各節點已寫入 route / guard / draft / grounding / final / moderator；
+    # 這裡補上只有 backend 才知道的兩塊：OCR 增補後的 user_input、以及最終 handoff_reason。
+    # fb_account / timestamp / call_cs 不放 trace（後端存 DB 時本來就有，避免重複）。
+    trace = dict(response.get("trace") or {})
+    trace["user_input"] = final_text   # 含 OCR 圖片文字的完整輸入（後端手上只有原始 content）
+    if price_guard_trace is not None:
+        trace["price_guard"] = price_guard_trace   # 價格守門：是否偵測到跨療程殘留價、重寫是否救回
+    if any(kw.lower() in user_query_lower for kw in CS_KEYWORDS):
+        trace["handoff_reason"] = "customer_keyword"   # 客人主動要真人（最優先，對應 call_cs=1）
+    elif sanitize_force_handoff:
+        trace["handoff_reason"] = "fact_check"          # AI 幻覺被 moderator 攔下
+    elif price_guard_handoff:
+        trace["handoff_reason"] = "price_fabrication"   # 價格守門重寫兩次仍錯 → 轉真人
+    elif call_cs == 2:
+        trace["handoff_reason"] = "booking"             # 預約流程觸發
+    else:
+        trace["handoff_reason"] = None
+
     response_body = BackendResponse(
         text=clean_text,
         images=all_images,
         CallCS=call_cs,
+        trace=trace,
     )
 
-    # 印出回傳給後端的完整 JSON（debug 用）
+    # 印出「真正回傳給後端的完整內容」（含 trace 全部）供 Portainer log 對照
     import json
     print(
-        "📤 [Response to Backend]:\n"
+        f"📤 [{datetime.now().isoformat()}] Response to Backend "
+        f"fb_account={user_input.fb_account}\n"
         + json.dumps(response_body.model_dump(), ensure_ascii=False, indent=2)
     )
 

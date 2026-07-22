@@ -24,15 +24,34 @@ def reciprocal_rank_fusion(*ranked_lists, k=60) -> List[str]:
 # def chinese_tokenizer(text):
 #     return [token for token in jieba.cut(text) if token.strip()]
 
-def get_qa_retriever():
-    doc = pd.read_csv("C:/Users/bexo6/OneDrive/桌面/line_clinics_agent/data/clinics_qa.csv", encoding="utf-8-sig")
+def get_qa_retriever(
+    csv_path: str = "data/clinics_qa.csv",
+    persist_dir: str = "./chroma_qa",
+    bm25_path: str = "./bm25_qa.pkl",
+    k: int = 2,
+):
+    """建立 QA ensemble retriever（向量 + BM25）。
+
+    參數化是為了讓「療程內容 QA」與「診所交易型 QA」各用一份獨立索引：
+    同一段建索引邏輯共用，但每個來源檔有自己的 persist_dir / bm25_path，
+    避免兩個領域的資料灌進同一個索引互相污染檢索排名。
+    ⚠️ 不同來源務必給不同的 persist_dir 與 bm25_path，否則快取會互蓋。
+    """
+    doc = pd.read_csv(csv_path, encoding="utf-8-sig")
 
     qa_documents_vector = []
     qa_documents_keyword = []
 
     for idx, row in doc.iterrows():
+        # 空值防呆：留空的格子在 pandas 是 NaN，直接 str() 會變成 "nan" 污染檢索，
+        # 這裡統一轉成空字串。
+        category = "" if pd.isna(row["category"]) else str(row["category"]).strip()
+        keywords = "" if pd.isna(row["keywords"]) else str(row["keywords"]).strip()
+
+        # 分類欄（療程專屬問答時 = 療程名，如「冷凍減脂」）也拼進可搜尋文字，
+        # 否則同一個問題（如「效果如何」）在不同療程間分不出來、會撈錯筆。
         # vector 用 (語意)
-        vector_content = f"問題：{row['question']}\n答案：{row['answer']}\n"
+        vector_content = f"分類：{category}\n問題：{row['question']}\n答案：{row['answer']}\n"
         qa_documents_vector.append(
             Document(
                 page_content=vector_content,
@@ -40,9 +59,10 @@ def get_qa_retriever():
             )
         )
 
-        # keyword 用 (重複 keywords 加強 BM25)
-        weighted_keywords = (row["keywords"] + " ") * 3
-        keyword_content = f"問題：{row['question']}\n答案：{row['answer']}\n關鍵字：{weighted_keywords}\n"
+        # keyword 用 (重複 keywords 加強 BM25；分類加權 ×2 幫助分辨是哪個療程)
+        weighted_keywords = (keywords + " ") * 3
+        weighted_category = (category + " ") * 2
+        keyword_content = f"分類：{weighted_category}\n問題：{row['question']}\n答案：{row['answer']}\n關鍵字：{weighted_keywords}\n"
         qa_documents_keyword.append(
             Document(
                 page_content=keyword_content,
@@ -51,7 +71,6 @@ def get_qa_retriever():
         )
 
 
-    persist_dir = "./chroma_qa"
     if not os.path.exists(persist_dir):
         vectorstore = Chroma.from_documents(
             documents=qa_documents_vector,
@@ -63,19 +82,20 @@ def get_qa_retriever():
             persist_directory=persist_dir,
             embedding_function=embedding_model
         )
-    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": k})
 
     # --- BM25 retriever ---
-    bm25_path = "./bm25_qa.pkl"
     if os.path.exists(bm25_path):
         with open(bm25_path, "rb") as f:
             bm25_retriever = pickle.load(f)
     else:
         bm25_retriever = BM25Retriever.from_documents(
-            qa_documents_keyword, preprocess_func=chinese_tokenizer, k=2
+            qa_documents_keyword, preprocess_func=chinese_tokenizer, k=k
         )
         with open(bm25_path, "wb") as f:
             pickle.dump(bm25_retriever, f)
+    # 快取的 pickle 會把舊的 k 一起帶回來 → 載入後強制覆寫，確保 k 生效（不必刪快取重建）
+    bm25_retriever.k = k
 
     # --- Ensemble (語意 + 關鍵字) ---
     qa_retriever = EnsembleRetriever(
@@ -84,25 +104,6 @@ def get_qa_retriever():
     )
 
     return qa_retriever
-    # def fused_retrieve(query: str, top_k: int = 5):
-    #     # 取出各自結果
-    #     bm25_results = bm25_retriever.get_relevant_documents(query)
-    #     vector_results = vector_retriever.get_relevant_documents(query)
-
-    #     # 取出 document_id 以利 RRF
-    #     bm25_ids = [str(d.metadata["document_id"]) for d in bm25_results]
-    #     vector_ids = [str(d.metadata["document_id"]) for d in vector_results]
-
-    #     # 用 RRF 融合排序
-    #     fused_ids = reciprocal_rank_fusion(bm25_ids, vector_ids)
-
-    #     # 根據融合後的排序回傳 Document
-    #     id_to_doc = {str(d.metadata["document_id"]): d for d in qa_documents_vector}
-    #     fused_docs = [id_to_doc[i] for i in fused_ids[:top_k] if i in id_to_doc]
-
-    #     return fused_docs
-    
-    # return fused_retrieve
 
 # if __name__ == "__main__":
 #     retriever = get_qa_retriever()

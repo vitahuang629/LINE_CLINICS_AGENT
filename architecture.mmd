@@ -1,0 +1,29 @@
+graph TD
+    User([LINE 客戶端 / 後端]) --> |接收文字或圖片| Stage1
+
+    subgraph 1. 圖片過濾與辨識
+        Stage1[圖片轉文字 OCR] -.->|繞過 OpenAI 安全審查| Text[統一轉換為純文字]
+    end
+
+    Text --> Stage2
+
+    subgraph 2. AI 客服分工 (多智能體系統)
+        Stage2{總機: 判斷客人需求}
+        Stage2 -->|詢問療程、保養、膚質| A[療程諮詢助理]
+        Stage2 -->|詢問價格、預約、地點| B[行政預約助理]
+        A --> C[品管: 檢查錯字與法規]
+        B --> C
+    end
+
+    C --> Stage3
+
+    subgraph 3. 智能配圖機制
+        Stage3{判斷是否需要附圖}
+        Stage3 -->|提到停車、地址等| D[自動附加預設靜態圖片]
+        Stage3 -->|提到特定療程<br>如: NEO, 瘦瘦筆| E[呼叫圖片 API<br>尋找最適合的對比照]
+        Stage3 -->|一般聊天| F[僅回傳文字]
+    end
+
+    D --> Result([回傳給客人])
+    E --> Result
+    F --> Result

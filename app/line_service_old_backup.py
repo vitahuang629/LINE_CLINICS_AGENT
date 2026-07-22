@@ -259,6 +259,22 @@ def handle_message(event: MessageEvent):
                         preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/skin_pencial_intro.jpg"
                     )
             ]
+    elif "NEO" in ai_reply and ("EMBODY" not in ai_reply and "SIS" not in ai_reply and "瘦瘦筆" not in ai_reply):
+        message = [
+                    TextSendMessage(text=ai_reply),
+                    ImageSendMessage(
+                        original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/neo_intro.jpg",
+                        preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/neo_intro.jpg"
+                    )
+            ]
+    elif "SIS" in ai_reply and ("EMBODY" not in ai_reply and "NEO" not in ai_reply and "瘦瘦筆" not in ai_reply):
+        message = [
+                    TextSendMessage(text=ai_reply),
+                    ImageSendMessage(
+                        original_content_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/sis_intro.jpg",
+                        preview_image_url="https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/sis_intro.jpg"
+                    )
+            ]
     elif urls:
         print('6666666666666666666')
         print(urls)

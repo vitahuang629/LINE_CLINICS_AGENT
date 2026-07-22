@@ -84,3 +84,5 @@ def get_consult_info(treatment_name: str, synonyms: list) -> str | None:
 
     print(f"[consult] 查無對應療程：{treatment_name}")
     return None
+
+

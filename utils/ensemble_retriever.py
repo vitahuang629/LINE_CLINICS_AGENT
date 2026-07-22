@@ -61,7 +61,7 @@ from utils.shared_resources import embedding_model, chinese_tokenizer
 
 def get_ensemble_retriever():
     # 讀取數據
-    doc = pd.read_csv("C:/Users/bexo6/OneDrive/桌面/line_clinics_agent/data/clinics_introductions3.csv", encoding="big5")
+    doc = pd.read_csv("data/clinics_introductions3.csv", encoding="big5")
     # print(doc)
 
     documents_for_vector = []
