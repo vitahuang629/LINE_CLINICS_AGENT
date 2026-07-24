@@ -77,7 +77,7 @@
   | **① 入口守門** | `guard_node`（gpt-4o-mini） | prompt injection 偵測（`GuardResult`），揪出「忽略前述指令 / 洩漏 system prompt」等注入 | 直接婉拒並結束對話 |
   | **② 生成期白名單** | information Composer prompt | **療程白名單**：只能推薦白名單內且檢索有撈到的療程；白名單外（肉毒、玻尿酸、電波拉皮…）一律禁提，找不到就誠實說沒有 | 不推薦、不自編療程 |
   | **③ 費用工具化** | `get_treatment_fee`（booking） | 報價一律查工具（讀 `treatment_fees` 表），**嚴禁**從記憶／歷史自編價 | 查無方案就誠實說沒有 |
-  | **④ 出口事實核對** | `moderator_node` faithfulness（gpt-4o） | 抽草稿裡的療程硬事實 + **逐字 quote** → 驗證是否真在 grounding（逐字命中或 `SequenceMatcher ≥ 0.7`）→ 無依據就刪除／中性化 | 刪完無法回答 → `[[HANDOFF]]` → 轉真人 |
+  | **④ 出口事實核對** | `moderator_node` faithfulness（gpt-4o） | grounding 切成**編號 chunk**（去重）；抽草稿裡的療程硬事實，每條標 **`source_id`（哪一號 chunk 支持它，無則 -1）** + 逐字 quote → 逐條**只對那一號 chunk**驗證：`-1` 判無依據、quote 逐字命中或 `SequenceMatcher ≥ 0.7` 放行、對不上（改寫過）→ 對該 chunk 做**語意蘊涵判斷** → 無依據就刪除／中性化 | 刪完無法回答 → `[[HANDOFF]]` → 轉真人 |
   | **④ 出口合規／語氣** | `moderator_node` cleaning | 移除誇大保證字眼（「一定會好」「完全消除」「治癒」）符合醫療法規；強制繁中；錯字修正 | — |
   | **⑤ 價格守門** | backend `_extract_prices` / `_rewrite_price_reply` | 抓回覆裡的 NT$ 價，出現「不屬本療程的價」→ 帶正確價**重寫一次**；仍錯 → 轉真人 | `price_fabrication` 轉真人 |
   | **轉真人** | `CS_KEYWORDS` | 客人主動要真人（轉專人／投訴／退費…）命中 → `CallCS=1`、清空 text/images | 立即轉接 |
@@ -97,7 +97,7 @@
   |---|---|---|
   | guard | `guard` | 是否判為注入、理由 |
   | supervisor | `route` / `route_reasoning` | 路由對不對、為什麼 |
-  | worker | `draft` / `grounding` | moderator 前草稿、本輪事實依據 |
+  | worker | `draft` / `grounding` | moderator 前草稿、本輪事實依據（有序去重的 chunk 清單） |
   | moderator | `final` / `moderator` | 最終文字；`{fact_check, unsupported_facts, force_handoff}` |
   | backend | `user_input` / `price_guard` / `handoff_reason` | 完整輸入（含 OCR）、價格守門過程、轉真人原因 |
 
