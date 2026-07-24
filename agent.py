@@ -15,6 +15,13 @@ import json
 import re
 from difflib import SequenceMatcher
 
+# 本診所療程白名單（含別名），由 TREATMENT_SYNONYMS 單一真相來源產生 —— 新增療程只要改
+# toolkit/toolkits.py，prompt 會自動跟上，不用兩邊手動同步。
+# 給 planner 判斷「哪些療程名是我們的、哪些是外院的」用。
+OUR_TREATMENTS_LINE = "、".join(
+    "／".join(sorted(group)) for group in TREATMENT_SYNONYMS
+)
+
 # 對話歷史改由後端在每次 request 的 messages 欄位傳入，不再使用 LangGraph checkpointer
 
 def get_latest_human_message(messages):
@@ -222,6 +229,14 @@ class FactCitation(TypedDict):   # moderator 事實核對：一條療程硬事�
 class ModeratorAudit(TypedDict):   # moderator 事實核對的結構化輸出
     facts: List[FactCitation]   # 草稿裡所有療程硬事實 + 逐字出處
     cleaned: str                # 已做合規/語氣/語言清理、但療程事實原封不動的草稿
+
+class EntailmentVerdict(TypedDict):   # 單條陳述的語意蘊涵判定
+    index: int      # 對應送進去的第幾條（從 0 開始）
+    entailed: bool  # 【診所資料】是否明確支持這條陳述
+    reason: str     # 判定理由（給 log / eval 看，不回給客人）
+
+class EntailmentAudit(TypedDict):   # 語意蘊涵判定的結構化輸出
+    results: List[EntailmentVerdict]
 
 def merge_trace(left: dict, right: dict) -> dict:
     """trace 欄位的 reducer：各節點各寫各的 key，淺層合併累積成整輪 trace。
@@ -566,6 +581,12 @@ class DoctorAppointmentAgent:
                - **必須用使用者原始症狀詞**（例如「法令紋」「木偶紋」「瘦大腿」），
                  **絕對不可**用分類標籤（不可寫「皺紋類」「皮膚其他」），否則檢索不到正確療程。
                - 多個症狀或比較題，用空白把原始詞串起來（例如「法令紋 木偶紋」「Emface 音波」）。
+               - **⭐ 比較題／客人提到外院療程時，檢索詞裡一定要含「我方療程名」或「客人的症狀原始詞」**。
+                 對照文末【本診所療程白名單】判斷哪些是我方療程、哪些是外院療程。
+                 ❌ 錯：客人說「有一家建議打玻尿酸，另一家是雙音波」→ search_query="玻尿酸 雙音波"
+                    （兩個都是外院療程，療程資料庫裡根本沒有，只會撈回一堆不相干的療程）
+                 ✅ 對：search_query="Emface 法令紋"（上文在談 Emface，客人困擾是法令紋）
+                 判斷不出我方療程時，至少要放客人的症狀原始詞，**絕不可只放外院療程名**。
                - **⭐ 客人回數字問卷時**：對照上一則 AI 問卷，把客人**選到的那幾項症狀文字**取出來串成
                  檢索詞（例：問卷「1.睡不好淺眠 2.打呼呼吸中止 3.長期依賴藥物…」+ 客人回「12」
                  → search_query="睡不好 淺眠 打呼 呼吸中止"）。只取客人有選的號碼，沒選的不要放。
@@ -576,6 +597,12 @@ class DoctorAppointmentAgent:
                怎麼計算次數等。
                - 是 → true。（這類是要「查該療程的標準答案」，不是要被同理關懷）
                - 只是要療程介紹／推薦，或一般診所問題（地址／付款／初診費）→ false。
+               - **⭐ 客人「提到」外院療程或別家診所的建議也算，不限於發問句**。例如
+                 「有一家是建議打玻尿酸，另一家是雙音波」「我之前做過電波」「聽說海芙音波不錯」——
+                 這些沒有問號，但客人真正想知道的就是「你們的跟那些差在哪」→ 視為
+                 「跟另一個療程差別」→ need_qa=true。
+                 此時 qa_treatment 填**上文正在談的我方療程**（對照文末白名單，不是填外院療程名），
+                 qa_query 寫成比較問句，例：「跟電波、音波有什麼不一樣」。
 
             6. qa_treatment：need_qa=true 時，這個問題是針對**哪個療程**（從本輪或上文判斷，
                例：冷凍減脂、SIS、Emface、瘦瘦針）。判斷不出來則回空字串 ""。
@@ -593,6 +620,16 @@ class DoctorAppointmentAgent:
                  · 問某療程的具體子問題（會不會痛 / 多少錢 / 修復期 / 幾次…，這些走 need_qa）。
                  · 沒指名到任何具體療程。
                （此欄一旦填了，系統會直接把該療程的官方介紹原文回給客人。）
+        """ + f"""
+            ─────────────────────────────────────────────
+            【本診所療程白名單】（唯一判準，斜線分隔的是同一療程的不同叫法）
+            {OUR_TREATMENTS_LINE}
+
+            ⚠️ 判斷「我方療程 vs 外院療程」一律以這份清單為準：
+               - 名字（或其別名）**在清單裡** → 我方療程，可以當 search_query / qa_treatment。
+               - 名字**不在清單裡**（玻尿酸、肉毒、埋線、電波拉皮、鳳凰電波、音波拉皮、海芙音波、
+                 水光針、雷射除斑…）→ **外院療程**，不可拿來當 search_query 或 qa_treatment，
+                 因為我們的資料庫查不到它們。
         """
         messages_for_planner = [{"role": "system", "content": planner_prompt}] + state["messages"]
         plan = self.info_planner_model.with_structured_output(InfoPlan).invoke(messages_for_planner)
@@ -776,8 +813,15 @@ class DoctorAppointmentAgent:
                根據檢索結果簡短推薦 1~3 個適合療程（只能用白名單內且檢索有撈到的），
                **不要報價或自編價格**（你沒有費用工具），結尾邀請顧客選定方向，例如
                「這幾個都蠻適合的，您比較想了解哪一個呢？選定後我可以幫您說明費用與初診安排 💕」。
-            5. 比較問題（如「Emface 跟音波差在哪」）：以檢索結果做中立比較；
-               若某療程檢索查無資料 → 誠實說「該療程目前不在我們提供的範圍，建議諮詢專業團隊或其他診所」，
+            5. 比較問題 / 客人提到外院療程（如「Emface 跟音波差在哪」
+               「有一家建議打玻尿酸，另一家建議雙音波」）：
+               ✅ **預設用正面說明**：以檢索結果直接比較兩者的「技術取向」差異，並介紹本診所
+                  對應的療程。例如「市面上常見的注射、埋線、電音波多是從外部作用，單一技術能
+                  處理的層次有限；而 Emface 是…」。
+               ❌ **不要主動說「我們沒有提供 X」**——客人問的是哪個適合他，不是我們有沒有；
+                  直接介紹我們有的療程，本身就已經回答了。撇清反而像沒回答到問題。
+               ⚠️ 例外：客人**直接詢問我們是否提供某療程**（「你們有玻尿酸嗎？」
+                  「所以你們沒有音波對吧？」）→ 據實回答沒有，不可迴避。
                不可用訓練知識補充比較；避免「一定更好」「保證效果」等絕對詞。
             6. 對比照：要展示前後對比照時，在文字中加入「這是[療程名稱]的對比照: <https 圖片網址>」，
                例如：這是 Emface 的對比照: https://hopkins-main.s3.ap-northeast-1.amazonaws.com/LINE_PHOTOS/emface_ollie_ba.jpg
@@ -789,6 +833,23 @@ class DoctorAppointmentAgent:
                若【系統提供資料】中**沒有明確依據，絕對不可自行編造或臆測**
                （例如嚴禁說「我們在多個地區都有分店」這種沒有根據的話）。
                這類沒有資料的問題，請改回覆：「這部分我幫您確認一下～稍後由專人為您說明 💕」。
+
+            9. 🚨 症狀對應防幻覺（客人一次講多個困擾時特別重要）🚨
+               客人常一口氣列出好幾個症狀（例：「鼻基底凹陷、法令紋」「肚子、大腿、蝴蝶袖」）。
+               **只能針對【系統提供資料】的「適合對象」裡真的有涵蓋的那些症狀，說該療程可以幫助改善。**
+               ❌ 嚴禁把客人提到的所有症狀一起攬下來，寫成「針對 A 和 B，這個療程可以幫助改善」——
+                  只要 B 不在適合對象裡，這句就是沒有依據的療效宣稱。
+               ✅ 正確做法：分開講。有涵蓋的照常說明；沒涵蓋的**不要宣稱有效，也不要說沒效**，
+                  改成導向專業評估。例如：
+                  「法令紋的部分，EMFACE 可以幫助改善…（說明）。
+                    至於鼻基底凹陷，建議由醫師現場評估後給您更精準的建議唷 💕」
+               ⚠️ 判斷依據只看【系統提供資料】列出的適合對象，不要用你自己的醫美知識推論
+                  「這個症狀應該也算在內」。
+               ⚠️ 也**不可以把適合對象裡的概括詞擴大解釋成客人講的特定部位**。
+                  例：資料只寫「凹陷」，客人問的是「鼻基底凹陷」→ 不可以寫成
+                  「雖然可以幫助改善臉部凹陷，但…」這種變相的療效宣稱；
+                  資料是概括詞、客人問的是特定部位時，**一律只導向醫師評估**，
+                  不要附帶任何「可以幫助改善」的說法。
 
             🚨 **療程名稱白名單（絕對重要）** 🚨
             本診所**只提供**以下療程，**絕對不可以**推薦或提及白名單以外的任何療程：
@@ -1204,7 +1265,17 @@ class DoctorAppointmentAgent:
 
         if do_fact_check:
             # ── 有驗證的 citation 事實核對：LLM 標逐字出處 → 程式驗證出處存在 → 無依據就刪/轉真人 ──
-            final_content, force_handoff, unsupported = self._fact_check_and_clean(draft_content, grounded, base_rules)
+            # 帶上客人這輪實際問的話：二次改寫要判斷「刪掉後還能不能回答核心問題」，
+            # 沒有這個資訊只能用猜的（實例：客人問「維持多久」，卻因為刪掉一句
+            # 「可改善鼻基底凹陷」就誤判成無法回答而轉真人）。
+            user_q = get_latest_human_message(state["messages"])
+            if isinstance(user_q, list):   # content 可能是 [{"type":"text","text":...}] 結構
+                user_q = " ".join(
+                    p.get("text", "") for p in user_q if isinstance(p, dict)
+                )
+            final_content, force_handoff, unsupported = self._fact_check_and_clean(
+                draft_content, grounded, base_rules, str(user_q or "")
+            )
         else:
             # 本輪沒檢索療程內容（純預約 / 問地址 / 閒聊）→ 只做合規/語氣/語言，用 mini
             unsupported = []
@@ -1248,7 +1319,7 @@ class DoctorAppointmentAgent:
             }
         )
 
-    def _fact_check_and_clean(self, draft_content, grounded, base_rules):
+    def _fact_check_and_clean(self, draft_content, grounded, base_rules, user_question=""):
         """有驗證的 citation 事實核對，回傳 (final_content, force_handoff, unsupported_facts)。
 
         1) LLM 抽出草稿裡的療程硬事實 + 逐字出處（quote），並同時輸出合規/語氣清理版（cleaned）。
@@ -1308,22 +1379,37 @@ class DoctorAppointmentAgent:
 
         grounded_norm = _norm(sources)
 
-        def _supported(quote):
-            q = _norm(quote)
+        def _coverage(text):
+            """text 有多少比例的字，能依序在診所資料裡對得上（逐字命中直接算滿分）。"""
+            q = _norm(text)
             if not q:
-                return False
+                return 0.0
             if q in grounded_norm:   # 逐字命中 → 直接過（最快、最可靠）
-                return True
+                return 1.0
             sm = SequenceMatcher(None, q, grounded_norm, autojunk=False)
-            covered = sum(b.size for b in sm.get_matching_blocks())
-            return covered / len(q) >= FACT_MATCH_THRESHOLD
+            return sum(b.size for b in sm.get_matching_blocks()) / len(q)
 
-        unsupported = [
-            (f.get("claim") or "").strip()
-            for f in (audit.get("facts") or [])
-            if not _supported(f.get("quote"))
-        ]
-        unsupported = [c for c in unsupported if c]
+        # ── 第一關：quote 逐字驗證（免費、確定性）──
+        #    LLM 有抄出可驗證的出處 → 直接放行，不必再花一趟 API。
+        # ── 第二關：語意蘊涵判斷（LLM）──
+        #    sources 常破萬字，LLM 經常抄不出「一字不差」的出處而回空字串。
+        #    此時不能用字串相似度補（實測：AI 一改寫語序，分數就從 0.90 崩到 0.55；
+        #    而捏造的短句對上萬字來源反而能拿 0.94——方向剛好相反）。
+        #    「這句話能不能從資料推導出來」本來就是語意問題，交給 LLM 判斷。
+        pending = []
+        for f in (audit.get("facts") or []):
+            claim = (f.get("claim") or "").strip()
+            if not claim:
+                continue
+            q = f.get("quote") or ""
+            qc = _coverage(q)
+            if qc >= FACT_MATCH_THRESHOLD:
+                print(f"  [fact] ✓ {claim[:40]} | quote({qc:.2f}) 逐字驗證通過")
+                continue
+            print(f"  [fact] ? {claim[:40]} | quote({qc:.2f})={q[:20] or '（無）'} → 送語意判斷")
+            pending.append(claim)
+
+        unsupported = self._entail_unsupported(pending, sources) if pending else []
 
         if not unsupported:
             print("[moderator] 療程事實全部驗證通過（逐字出處均存在）")
@@ -1331,14 +1417,18 @@ class DoctorAppointmentAgent:
 
         print(f"[moderator] 無依據事實 {len(unsupported)} 條 → 二次改寫刪除：{unsupported}")
         rewrite_prompt = (
-            "以下【內容】中，這幾條『療程事實』經查證**沒有依據**，請處理：\n"
+            (f"【客人這輪問的話】\n{user_question}\n\n" if user_question else "")
+            + "以下【內容】中，這幾條『療程事實』經查證**沒有依據**，請處理：\n"
             + "\n".join(f"- {c}" for c in unsupported) +
             "\n\n規則：\n"
             "1. 把上面每一條沒依據的事實從內容中刪掉，或改成不提及該細節的中性說法"
             "（例如「這部分我幫您確認一下～稍後由專人為您說明」）；**嚴禁**自己補上正確答案。\n"
             "2. 其餘有依據的內容、關懷、推薦、預約引導、網址 / 圖片連結、emoji、換行一律**原樣保留**。\n"
-            "3. 若刪掉這些事實後，剩下的內容**已無法回答客人本來問的核心問題**，"
-            "請**只輸出這一行**：[[HANDOFF]]（前後不要有任何其他字）。\n"
+            "3. ⚠️ 判斷是否轉真人時，請對照上面【客人這輪問的話】：\n"
+            "   · 客人常一次問好幾件事。**只要其中任何一件仍然回答得出來，就不要轉真人**——"
+            "回答得出來的照常回答，回答不出來的那部分改成「建議由醫師／專人現場評估」。\n"
+            "   · 只有在**客人問的每一件事都因為刪除而無法回答**時，才輸出"
+            "**這一行**：[[HANDOFF]]（前後不要有任何其他字）。\n"
             "只輸出最終要給客人的純文字，不要任何解釋。"
         )
         try:
@@ -1355,6 +1445,63 @@ class DoctorAppointmentAgent:
             print("[moderator] 刪除無依據事實後已無法回答核心問題 → 轉真人")
             return draft_content, True, unsupported
         return (out or cleaned), False, unsupported
+
+    def _entail_unsupported(self, claims, sources):
+        """語意蘊涵判斷：從 claims 中篩掉「診所資料確實支持」的，回傳仍無依據的那些。
+
+        取代先前用 SequenceMatcher 拿 claim 本身做模糊比對的作法——實測證實字串相似度
+        分不開「有依據的改寫」與「捏造」：AI 把資料重組成通順句子後語序一變，分數就從
+        0.90 崩到 0.55；反過來捏造的短句（「EMFACE 可維持三年以上」）對上萬字來源
+        卻能拿到 0.94。判斷「能否從資料推導」是語意問題，不是字元重疊問題。
+
+        一次批次問完所有待判 claim，只花一趟 API。
+        """
+        listing = "\n".join(f"[{i}] {c}" for i, c in enumerate(claims))
+        prompt = (
+            "你是醫療資訊的事實查核員。針對【待查陳述】裡的每一條，判斷它是否能從"
+            "【診所資料】推導出來，逐條輸出判定。\n\n"
+            "判定標準：\n"
+            "- entailed=true：資料裡有明確支持這條陳述的內容。**用字不同、語序不同、"
+            "把資料的好幾句話合併改寫，都算數**——只看意思有沒有被資料支持。\n"
+            "- entailed=false，只要符合任一項：\n"
+            "  · 資料裡完全沒提到這件事。\n"
+            "  · 陳述比資料**多講了東西**（多出來的數據、次數、年限、價格、品牌、"
+            "認證、英文全名、療效範圍）。\n"
+            "  · 資料講的是**相近但不同**的事（例：資料寫「凹陷」，陳述寫「鼻基底凹陷」；"
+            "資料寫「間隔一週」，陳述寫「每週都要做」）。\n"
+            "  · 陳述把資料的保守說法變成**保證或絕對**（例：資料「一般維持一年以上」→ "
+            "陳述「保證維持一年」）。\n\n"
+            "⚠️ **只能依據【診所資料】判斷，絕對不可以用你自己的醫美知識補足。**\n"
+            "⚠️ 「聽起來很合理」「業界常識就是這樣」都**不算**有依據。**不確定一律回 false。**\n"
+            "reason 用一句話說明依據在資料的哪裡（或缺什麼）。\n\n"
+            f"【診所資料】\n{sources}\n\n"
+            f"【待查陳述】\n{listing}"
+        )
+        try:
+            out = self.moderator_fact_model.with_structured_output(EntailmentAudit).invoke(
+                [{"role": "system", "content": prompt}]
+            )
+        except Exception as e:
+            # 判不出來就一律當成無依據（保守方向：寧可少講，不可講錯）
+            print(f"❌ [moderator] 語意判斷失敗: {e} → 全部視為無依據")
+            return list(claims)
+
+        verdicts = {}
+        for r in (out.get("results") or []):
+            try:
+                verdicts[int(r.get("index"))] = r
+            except (TypeError, ValueError):
+                continue
+
+        unsupported = []
+        for i, c in enumerate(claims):
+            v = verdicts.get(i) or {}
+            ok = bool(v.get("entailed"))
+            print(f"  [entail] {'✓' if ok else '✗'} {c[:42]}"
+                  f"{'' if ok else '  ← ' + str(v.get('reason') or '未回傳判定')[:44]}")
+            if not ok:
+                unsupported.append(c)
+        return unsupported
 
     def workflow(self):
         # 註解掉舊的 memory saver
