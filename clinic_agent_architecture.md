@@ -331,9 +331,9 @@ Booking prompt 已改：報體驗價「**一定呼叫 `get_treatment_fee(療程�
 - 本輪沒檢索到療程內容（純預約 / 問地址 / 閒聊）時，只做上述清理（用 `gpt-4o-mini`）；清理 API 失敗 → 保留原草稿並 `force_handoff=True`（最保守）。
 
 ### 9.2 事實核對 (faithfulness)：`do_fact_check = bool(grounded) and not skip_fact_check`
-本輪 retriever / 查表撈到「事實來源」（`grounded_content_var`）且非 booking route 時，走 `_fact_check_and_clean`（強模型 gpt-4o）：
-1. LLM 抽出草稿裡的療程硬事實（英文全名 / 縮寫 / 原理 / 數據 / 機器品牌名 / 是否提供某療程）+ **逐字 quote**，並同時輸出合規清理版。
-2. 程式驗證每條 quote 是否真在 grounding（逐字命中，或 `SequenceMatcher` 涵蓋率 ≥ 0.7）。
+本輪 retriever / 查表撈到「事實來源」（`grounded_content_var`）且非 booking route 時，走 `_fact_check_and_clean`（強模型 gpt-4o）。`grounded_content_var` 是「有序、去重的 chunk 清單」——`register_grounded_content` 把每份撈到的內容按 `\n\n---\n\n` 切成 chunk、只留首次出現（chunk 級去重，消掉同一段原文經不同管道重複塞入的重疊）：
+1. sources 以 `[n]` 編號逐段送給 LLM。LLM 抽出草稿裡的療程硬事實（英文全名 / 縮寫 / 原理 / 數據 / 機器品牌名 / 是否提供某療程），每條標 **`source_id`（哪一號 chunk 支持它，無則 -1）** + 從該 chunk **逐字複製的 quote**，並同時輸出合規清理版。
+2. 程式驗證，每條縮到它那一號 chunk：`source_id=-1` → 無依據；quote 對該 chunk 逐字命中或 `SequenceMatcher` 涵蓋率 ≥ 0.7 → 過；對不上（多半被改寫過）→ 只對**該 chunk** 做語意蘊涵判斷（`_entail_unsupported`）。作用域縮到單一小 chunk，逐字與語意兩關都又快又準，且不會被別段的字誤命中。
 3. 有無依據的事實 → 二次改寫刪除 / 中性化；刪完已無法回答核心問題 → 回 `[[HANDOFF]]` → `force_handoff`（backend 據此設 CallCS=1，`handoff_reason=fact_check`）。
 - 組 sources 時會把 `authorized_treatments_var`（本輪從診所 DB 合法檢索到的療程）補一行「本診所有提供以下療程：…」進來源，讓「我們有提供 SIS」這種 claim 對得到依據（否則介紹文裡沒有「我們提供」字樣會被誤砍）。
 - 費用（`get_treatment_fee`）與 consult（初診）內容也會 `register_grounded_content`，正確價格 / 初診描述不會被事實核對誤砍。
@@ -594,8 +594,9 @@ BackendResponse(text, images, CallCS, trace) ─► Backend
 - 輕量模型一次輸出結構化 `InfoPlan` → 確定性工具呼叫 → 單次 Composer（gpt-4o），取代原 ReAct 迴圈。（詳見 §7）
 
 ### 17.6 Moderator 事實核對（faithfulness）與旗標
-- `do_fact_check = bool(grounded) and not skip_fact_check`；`_fact_check_and_clean`（gpt-4o）抽療程硬事實 + 逐字 quote → 程式驗證（逐字或 `SequenceMatcher` ≥ 0.7）→ 無依據就刪 / 中性化，刪完無法回答 → `[[HANDOFF]]` → force_handoff。
-- `skip_moderation`（原文直出直通）、`skip_fact_check`（booking route 只做語氣/合規）；組 sources 補 `authorized_treatments_var` 一行「本診所有提供以下療程…」；fee / consult 內容也 register 成 grounding。（詳見 §9）
+- `do_fact_check = bool(grounded) and not skip_fact_check`；`grounded` 是「有序、去重的 chunk 清單」（`register_grounded_content` 按 `\n\n---\n\n` 切 chunk、首次出現才留，消掉跨管道的近似重疊）。
+- `_fact_check_and_clean`（gpt-4o）把 grounding 以 `[n]` 編號逐段送 LLM，抽療程硬事實時每條標 `source_id`（哪一號 chunk 支持它，無則 -1）+ 逐字 quote → 程式驗證**每條縮到它那一號 chunk**：`source_id=-1` 判無依據；quote 逐字命中或 `SequenceMatcher` ≥ 0.7 放行；對不上（多半改寫過）→ 只對**該 chunk** 做語意蘊涵判斷（`_entail_unsupported`）。無依據就刪 / 中性化，刪完無法回答 → `[[HANDOFF]]` → force_handoff。作用域縮到單一 chunk，逐字與語意兩關都又快又準，且不會被別段的字誤命中。
+- `skip_moderation`（原文直出直通）、`skip_fact_check`（booking route 只做語氣/合規）；組 chunk 清單時補 `authorized_treatments_var` 一個「本診所有提供以下療程…」chunk、各療程官方介紹原文各補一個 chunk（chunk 級去重）；fee / consult 內容也 register 成 grounding。（詳見 §9）
 
 ### 17.7 健保 / 保險路由
 - supervisor：健保 / 保險 / 理賠 / 自費 → booking_node；booking `search_clinics_info` 可處理清單加入「健保 / 保險政策」→ `search_clinics_info("診所", "健保")`（保險理賠用「保險」），走 clinic_qa。（詳見 §8）

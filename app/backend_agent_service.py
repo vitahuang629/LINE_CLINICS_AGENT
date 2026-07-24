@@ -434,8 +434,9 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
 
     # 重設本 request 的「合法療程」集合（由 search_clinics_by_keyword 動態累積）
     authorized_treatments_var.set(set())
-    # 重設本 request 的「事實來源」集合（由各 retriever 動態累積，供 sanitize faithfulness 核對）
-    grounded_content_var.set(set())
+    # 重設本 request 的「事實來源」清單（由各 retriever 動態累積成有序、去重的 chunk list，
+    # 供 sanitize faithfulness 核對）
+    grounded_content_var.set([])
     # 把「整張費用表」原封不動存入（不預先 filter）；由 booking 的 get_treatment_fee 工具
     # 在認出療程的當下才 filter。取代舊的 graph 前弱解析預注入，避免代名詞/序數解析失敗導致編價。
     treatment_fees_var.set(user_input.treatment_fees or [])

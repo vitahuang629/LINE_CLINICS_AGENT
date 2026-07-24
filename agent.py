@@ -222,9 +222,10 @@ class InfoPlan(TypedDict):   # information_node 前置規劃（取代 ReAct 的�
     intro_treatment: str # 客人要「介紹某單一指名療程 / 有沒有某療程 / 某療程是什麼 / 功效」時填該療程名，
                          # 觸發原文直出 CSV 介紹；症狀求推薦、比較兩療程、問具體子問題（會不會痛/多少錢/修復期）→ 回 ""
 
-class FactCitation(TypedDict):   # moderator 事實核對：一條療程硬事實 + 它的逐字出處
-    claim: str   # 草稿中的療程硬事實（英文全名/縮寫/原理/數據/機器品牌名/是否提供某療程）
-    quote: str   # 從【診所資料】逐字複製、能支持該 claim 的原文；找不到依據時回空字串 ""
+class FactCitation(TypedDict):   # moderator 事實核對：一條療程硬事實 + 它的編號出處 + 逐字出處
+    claim: str        # 草稿中的療程硬事實（英文全名/縮寫/原理/數據/機器品牌名/是否提供某療程）
+    source_id: int    # 支持該 claim 的那一號 chunk 編號（[0]、[1]…）；找不到任何依據時回 -1
+    quote: str        # 從第 source_id 號 chunk 逐字複製、能支持該 claim 的原文；source_id=-1 時回 ""
 
 class ModeratorAudit(TypedDict):   # moderator 事實核對的結構化輸出
     facts: List[FactCitation]   # 草稿裡所有療程硬事實 + 逐字出處
@@ -1322,41 +1323,58 @@ class DoctorAppointmentAgent:
     def _fact_check_and_clean(self, draft_content, grounded, base_rules, user_question=""):
         """有驗證的 citation 事實核對，回傳 (final_content, force_handoff, unsupported_facts)。
 
-        1) LLM 抽出草稿裡的療程硬事實 + 逐字出處（quote），並同時輸出合規/語氣清理版（cleaned）。
-        2) 程式驗證：每條 quote 必須真的（去空白後）存在於【診所資料】——擋掉「引用造假」。
+        grounded 已切成「有序、去重的 chunk 清單」；每段以 [n] 編號送給 LLM。
+        1) LLM 抽出草稿裡的療程硬事實，每條標註 source_id（哪一號 chunk 支持它，無則 -1）
+           + 從該 chunk 逐字複製的 quote，並同時輸出合規/語氣清理版（cleaned）。
+        2) 程式驗證（每條縮到它那一號 chunk）：source_id=-1 → 無依據；quote 對該 chunk 逐字命中 → 過；
+           對不上（多半改寫過）→ 只對該 chunk 做語意蘊涵判斷。擋掉「引用造假」與「捏造細節」。
         3) 有無依據的事實 → 二次改寫，把那幾條刪掉/中性化；若刪完已無法回答核心問題 → 轉真人。
         """
-        sources = "\n\n---\n\n".join(sorted(grounded)) if isinstance(grounded, set) else str(grounded)
+        # grounded 現在是「有序、去重的 chunk list」（register 時已按 --- 切開 + 首次出現才留）。
+        # 仍容忍舊型別（set / 非序列）以防呼叫端未同步，退化成單塊。
+        if isinstance(grounded, (list, tuple)):
+            chunks = list(grounded)
+        elif isinstance(grounded, set):
+            chunks = sorted(grounded)
+        else:
+            chunks = [str(grounded)] if grounded else []
 
         # 「本診所是否提供某療程」的依據不是介紹文裡的某句話，而是「該療程這輪從診所 DB 被合法檢索到」
-        # （記在 authorized_treatments_var）。把這份清單補成一行來源，否則「我們有提供 SIS」這種 claim
+        # （記在 authorized_treatments_var）。把這份清單補成一個 chunk，否則「我們有提供 SIS」這種 claim
         # 在只描述療程內容的介紹文裡找不到逐字出處，會被誤判無依據而砍掉、進而轉真人。
         authorized = authorized_treatments_var.get() or set()
         if authorized:
-            sources = "本診所有提供以下療程：" + "、".join(sorted(authorized)) + "\n\n---\n\n" + sources
-            # 修法 B：把本輪在談療程的「官方介紹原文」也補進事實來源。
+            chunks.append("本診所有提供以下療程：" + "、".join(sorted(authorized)))
+            # 修法 B：把本輪在談療程的「官方介紹原文」也補成獨立 chunk。
             # 情境：planner 沒走「介紹原文直出」而掉進一般檢索，且該輪只撈到某個窄問答時，
             # AI 若用官方介紹內容描述療程（例如「冷凍減脂是一種非侵入性療程，透過冷凍…減少脂肪」），
             # 會因該介紹原文不在來源池 → 被誤判無依據 → 二次改寫刪不掉核心 → 誤轉真人。
             # 介紹原文本身即官方 CSV 事實，補進來源池可讓「合法的療程描述」通過核對；
             # 不影響對捏造價格等真危險的攔截（價格不在介紹原文，且另有輸出端價格守門）。
-            intro_sources = [s for s in (get_treatment_intro(t) for t in sorted(authorized)) if s]
-            if intro_sources:
-                sources = sources + "\n\n---\n\n" + "\n\n---\n\n".join(intro_sources)
+            # chunk 級去重：若該介紹已被檢索路徑登錄過，這裡不再重複塞入。
+            for t in sorted(authorized):
+                intro = (get_treatment_intro(t) or "").strip()
+                if intro and intro not in chunks:
+                    chunks.append(intro)
+
+        # 編號渲染：讓 extract 能引用「第幾號 chunk」，不必從一大堆文字裡逐字複製長句。
+        sources_numbered = "\n\n".join(f"[{i}] {c}" for i, c in enumerate(chunks))
 
         extract_prompt = (
             "你是醫療法規審查員 + 事實核對員。針對【AI 草稿】輸出結構化結果：\n\n"
             "1) facts：列出草稿裡所有『療程硬事實』——英文全名 / 縮寫意義 / 全稱、技術原理、"
             "溫度 / 深度 / 時間 / 次數等數據、機器 / 品牌 / 廠商名、診所是否提供某療程。每一條給：\n"
             "   - claim：該事實（用草稿原話）。\n"
-            "   - quote：從【診所資料】**逐字複製**一段能支持這條 claim 的原文（一字不改、含標點）；\n"
-            "     若【診所資料】裡找不到支持它的內容，quote 一律回空字串 \"\"（**嚴禁**自己生出處）。\n"
+            "   - source_id：【診所資料】裡支持這條 claim 的那一段前面的編號（[0]、[1]…）的**數字**。"
+            "只能引用**單一**最貼切的那一段；若沒有任何一段支持它，一律回 -1（**嚴禁**硬湊編號）。\n"
+            "   - quote：從 source_id 指的那一段裡**逐字複製**一小段能支持 claim 的原文（一字不改、含標點）；"
+            "source_id=-1 時 quote 回空字串 \"\"。\n"
             "   關懷、需求引導、推薦、預約引導等『非事實』內容不要列入 facts。\n\n"
             "2) cleaned：把草稿做下列『合規 / 語氣 / 語言』清理後的版本，"
             "但**療程事實本身先原封不動**（是否有依據交由後續程式驗證）：\n"
             + base_rules +
             "5. 關心語句、需求引導、推薦詢問、預約引導等非事實內容一律保留，語氣維持親切。\n\n"
-            f"【診所資料】\n{sources}"
+            f"【診所資料】（每段前面的 [n] 是它的編號）\n{sources_numbered}"
         )
         try:
             audit = self.moderator_fact_model.with_structured_output(ModeratorAudit).invoke([
@@ -1369,47 +1387,56 @@ class DoctorAppointmentAgent:
 
         cleaned = (audit.get("cleaned") or "").strip() or draft_content
 
-        # ── 程式驗證：quote 需能對應到【診所資料】（去空白後比對）。逐字命中直接過；
-        #    否則用涵蓋率模糊比對（quote 有多少比例的字依序對得上診所資料），放寬容忍模型「沒逐字照抄」，
-        #    減少誤刪；真瞎編的字對不上、涵蓋率低，照樣擋掉。門檻可調（越高越嚴）。──
+        # ── 程式驗證：每條 fact 由 extract 指到「單一 chunk」（source_id）。quote 只需對那一小塊比對，
+        #    逐字命中直接過；否則用涵蓋率模糊比對（放寬容忍模型「沒逐字照抄」，減少誤刪）。
+        #    作用域縮到單一 chunk，比對又快又準，也不會被別的 chunk 的字誤命中。門檻可調（越高越嚴）。──
         FACT_MATCH_THRESHOLD = 0.7
 
         def _norm(s):
             return re.sub(r"\s+", "", s or "")
 
-        grounded_norm = _norm(sources)
-
-        def _coverage(text):
-            """text 有多少比例的字，能依序在診所資料裡對得上（逐字命中直接算滿分）。"""
+        def _coverage(text, haystack):
+            """text 有多少比例的字，能依序在 haystack 裡對得上（逐字命中直接算滿分）。"""
             q = _norm(text)
             if not q:
                 return 0.0
-            if q in grounded_norm:   # 逐字命中 → 直接過（最快、最可靠）
+            hay = _norm(haystack)
+            if q in hay:   # 逐字命中 → 直接過（最快、最可靠）
                 return 1.0
-            sm = SequenceMatcher(None, q, grounded_norm, autojunk=False)
+            sm = SequenceMatcher(None, q, hay, autojunk=False)
             return sum(b.size for b in sm.get_matching_blocks()) / len(q)
 
-        # ── 第一關：quote 逐字驗證（免費、確定性）──
-        #    LLM 有抄出可驗證的出處 → 直接放行，不必再花一趟 API。
-        # ── 第二關：語意蘊涵判斷（LLM）──
-        #    sources 常破萬字，LLM 經常抄不出「一字不差」的出處而回空字串。
-        #    此時不能用字串相似度補（實測：AI 一改寫語序，分數就從 0.90 崩到 0.55；
-        #    而捏造的短句對上萬字來源反而能拿 0.94——方向剛好相反）。
-        #    「這句話能不能從資料推導出來」本來就是語意問題，交給 LLM 判斷。
-        pending = []
+        # 三分支（每條 fact 都縮到它自己那一號 chunk）：
+        # ── source_id 無效／-1：模型自己說沒出處 → 直接無依據，不必再花語意判斷。
+        # ── 第一關：quote 對「該號 chunk」逐字驗證（免費、確定性）→ 有抄到可驗證出處直接放行。
+        # ── 第二關：quote 對不上（多半被改寫過）→ 送語意蘊涵判斷，且只對「那一號 chunk」判。
+        #    不能用字串相似度補（實測：AI 一改寫語序分數就從 0.90 崩到 0.55；而捏造的短句對上
+        #    大段來源反而能拿高分——方向剛好相反）。「能不能從這段推導」是語意問題，交給 LLM。
+        pending = []       # [(claim, chunk_text)] 送語意判斷
+        unsupported = []
         for f in (audit.get("facts") or []):
             claim = (f.get("claim") or "").strip()
             if not claim:
                 continue
-            q = f.get("quote") or ""
-            qc = _coverage(q)
-            if qc >= FACT_MATCH_THRESHOLD:
-                print(f"  [fact] ✓ {claim[:40]} | quote({qc:.2f}) 逐字驗證通過")
+            try:
+                sid = int(f.get("source_id"))
+            except (TypeError, ValueError):
+                sid = -1
+            if not (0 <= sid < len(chunks)):
+                print(f"  [fact] ✗ {claim[:40]} | source_id={f.get('source_id')!r} 無出處 → 無依據")
+                unsupported.append(claim)
                 continue
-            print(f"  [fact] ? {claim[:40]} | quote({qc:.2f})={q[:20] or '（無）'} → 送語意判斷")
-            pending.append(claim)
+            chunk = chunks[sid]
+            q = f.get("quote") or ""
+            qc = _coverage(q, chunk)
+            if qc >= FACT_MATCH_THRESHOLD:
+                print(f"  [fact] ✓ {claim[:40]} | quote({qc:.2f}) 逐字驗證通過 @chunk[{sid}]")
+                continue
+            print(f"  [fact] ? {claim[:40]} | quote({qc:.2f})={q[:20] or '（無）'} → 送語意判斷 @chunk[{sid}]")
+            pending.append((claim, chunk))
 
-        unsupported = self._entail_unsupported(pending, sources) if pending else []
+        if pending:
+            unsupported += self._entail_unsupported(pending)
 
         if not unsupported:
             print("[moderator] 療程事實全部驗證通過（逐字出處均存在）")
@@ -1446,36 +1473,41 @@ class DoctorAppointmentAgent:
             return draft_content, True, unsupported
         return (out or cleaned), False, unsupported
 
-    def _entail_unsupported(self, claims, sources):
-        """語意蘊涵判斷：從 claims 中篩掉「診所資料確實支持」的，回傳仍無依據的那些。
+    def _entail_unsupported(self, items):
+        """語意蘊涵判斷：items 為 [(claim, chunk_text)]，每條只對它自己那一號 chunk 判定，
+        回傳仍無依據的 claim 清單。
 
         取代先前用 SequenceMatcher 拿 claim 本身做模糊比對的作法——實測證實字串相似度
         分不開「有依據的改寫」與「捏造」：AI 把資料重組成通順句子後語序一變，分數就從
-        0.90 崩到 0.55；反過來捏造的短句（「EMFACE 可維持三年以上」）對上萬字來源
+        0.90 崩到 0.55；反過來捏造的短句（「EMFACE 可維持三年以上」）對上大段來源
         卻能拿到 0.94。判斷「能否從資料推導」是語意問題，不是字元重疊問題。
 
-        一次批次問完所有待判 claim，只花一趟 API。
+        grounded 已切成 chunk、每條 claim 都由 extract 指到單一 chunk，所以這裡是
+        「這句話能不能從『這一小段』推導」，作用域小、又快又準。一次批次問完，只花一趟 API。
         """
-        listing = "\n".join(f"[{i}] {c}" for i, c in enumerate(claims))
+        listing = "\n\n".join(
+            f"[{i}] 陳述：{c}\n     依據：{chunk}"
+            for i, (c, chunk) in enumerate(items)
+        )
         prompt = (
-            "你是醫療資訊的事實查核員。針對【待查陳述】裡的每一條，判斷它是否能從"
-            "【診所資料】推導出來，逐條輸出判定。\n\n"
+            "你是醫療資訊的事實查核員。針對【待查清單】裡的每一條，判斷它的『陳述』"
+            "是否能從它自己所附的『依據』段落推導出來，逐條輸出判定。\n\n"
             "判定標準：\n"
-            "- entailed=true：資料裡有明確支持這條陳述的內容。**用字不同、語序不同、"
-            "把資料的好幾句話合併改寫，都算數**——只看意思有沒有被資料支持。\n"
+            "- entailed=true：依據段落裡有明確支持這條陳述的內容。**用字不同、語序不同、"
+            "把依據的好幾句話合併改寫，都算數**——只看意思有沒有被依據支持。\n"
             "- entailed=false，只要符合任一項：\n"
-            "  · 資料裡完全沒提到這件事。\n"
-            "  · 陳述比資料**多講了東西**（多出來的數據、次數、年限、價格、品牌、"
+            "  · 依據裡完全沒提到這件事。\n"
+            "  · 陳述比依據**多講了東西**（多出來的數據、次數、年限、價格、品牌、"
             "認證、英文全名、療效範圍）。\n"
-            "  · 資料講的是**相近但不同**的事（例：資料寫「凹陷」，陳述寫「鼻基底凹陷」；"
-            "資料寫「間隔一週」，陳述寫「每週都要做」）。\n"
-            "  · 陳述把資料的保守說法變成**保證或絕對**（例：資料「一般維持一年以上」→ "
+            "  · 依據講的是**相近但不同**的事（例：依據寫「凹陷」，陳述寫「鼻基底凹陷」；"
+            "依據寫「間隔一週」，陳述寫「每週都要做」）。\n"
+            "  · 陳述把依據的保守說法變成**保證或絕對**（例：依據「一般維持一年以上」→ "
             "陳述「保證維持一年」）。\n\n"
-            "⚠️ **只能依據【診所資料】判斷，絕對不可以用你自己的醫美知識補足。**\n"
+            "⚠️ **只能依據每條自己所附的『依據』段落判斷，絕對不可以用你自己的醫美知識補足，"
+            "也不可以借用別條的依據。**\n"
             "⚠️ 「聽起來很合理」「業界常識就是這樣」都**不算**有依據。**不確定一律回 false。**\n"
-            "reason 用一句話說明依據在資料的哪裡（或缺什麼）。\n\n"
-            f"【診所資料】\n{sources}\n\n"
-            f"【待查陳述】\n{listing}"
+            "reason 用一句話說明依據在哪裡（或缺什麼）。\n\n"
+            f"【待查清單】\n{listing}"
         )
         try:
             out = self.moderator_fact_model.with_structured_output(EntailmentAudit).invoke(
@@ -1484,7 +1516,7 @@ class DoctorAppointmentAgent:
         except Exception as e:
             # 判不出來就一律當成無依據（保守方向：寧可少講，不可講錯）
             print(f"❌ [moderator] 語意判斷失敗: {e} → 全部視為無依據")
-            return list(claims)
+            return [c for c, _ in items]
 
         verdicts = {}
         for r in (out.get("results") or []):
@@ -1494,7 +1526,7 @@ class DoctorAppointmentAgent:
                 continue
 
         unsupported = []
-        for i, c in enumerate(claims):
+        for i, (c, _chunk) in enumerate(items):
             v = verdicts.get(i) or {}
             ok = bool(v.get("entailed"))
             print(f"  [entail] {'✓' if ok else '✗'} {c[:42]}"

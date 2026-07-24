@@ -40,16 +40,25 @@ def register_grounded_content(text: str) -> None:
     """
     把本輪 retriever 撈到的原始內容登錄為「事實來源」，供 sanitize 的 faithfulness 核對。
 
-    ⚠️ 與 authorized_treatments_var 同樣的理由：必須**原地 mutate 同一個 set 物件**，
+    以「有序、去重的 chunk list」保存：傳入文字先按 retriever 慣用的 "\n\n---\n\n"
+    分隔切成 chunk，逐塊登錄，只有「首次出現」的 chunk 會留下（chunk 級去重）。
+    這讓 moderator 事實核對能對「單一小 chunk」逐字/語意比對，又快又準；
+    也自然消掉「同一段原文經不同管道以不同包裝重複塞入」的重疊
+    （set 只能去掉整段相同，抓不到這種近似重複）。
+
+    ⚠️ 與 authorized_treatments_var 同樣的理由：必須**原地 mutate 同一個 list 物件**，
     不可換新物件再 set 回去——node 可能跑在 copy_context 裡，在 copy 內重建物件不會傳回
-    父 context，但原地 .add() 因共用同一參照，父 context（sanitize）讀得到。
+    父 context，但原地 .append() 因共用同一參照，父 context（sanitize）讀得到。
     """
     if not text or not str(text).strip():
         return
     cur = grounded_content_var.get()
     if cur is None:
-        cur = set()
-    cur.add(str(text).strip())
+        cur = []
+    for piece in str(text).split("\n\n---\n\n"):
+        piece = piece.strip()
+        if piece and piece not in cur:
+            cur.append(piece)
     grounded_content_var.set(cur)
 
 # 療程同義詞 / 別名群組：每一組代表「同一個療程」的不同講法（正規名、學名、英文、暱稱）
