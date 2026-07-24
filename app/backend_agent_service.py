@@ -523,7 +523,42 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
             "recursion_limit": 20
         }
     }
-    response = app_graph.invoke(query_data, config=config)
+    # 🛡️ 兜底：graph 執行期間任何未預期例外（工具參數驗證失敗、OpenAI 抽風/逾時、
+    #    recursion limit…）都在此接住，避免整個 request 變成 HTTP 500、客人已讀不回。
+    #    回覆內容都在 graph 裡生成、崩潰風險幾乎都在這；後處理唯二會炸的外部呼叫
+    #    （價格守門 LLM 重寫、圖片 embedding API）本身已各自有 try/except。
+    #    兩段式降級（stateless，靠後端傳來的 message_history 判斷）：
+    #      首次崩潰          → 回罐頭請客人重述（CallCS=0，不轉真人）
+    #      客人重述後又崩潰  → 轉真人（CallCS=1），避免卡在「請再說一次」鬼打牆
+    RETRY_CANNED = "不好意思，麻煩您再訴說一次您的問題，謝謝！"
+    try:
+        response = app_graph.invoke(query_data, config=config)
+    except Exception as e:
+        import traceback
+        print(
+            f"❌ [{datetime.now().isoformat()}] graph 崩潰 "
+            f"fb_account={user_input.fb_account}: {e}"
+        )
+        traceback.print_exc()   # 完整堆疊留在後端 log，方便事後抓真正的 bug
+        # message_history 由後端傳來、順序「由新到舊」→ 第一個 type=="ai" 即上一輪 AI 回覆。
+        last_ai = next(
+            (m.content for m in user_input.message_history if m.type == "ai"),
+            None,
+        )
+        if last_ai and RETRY_CANNED in last_ai:
+            # 上一輪已回過罐頭、客人重述後又炸 → 可能換句話說也繞不過 → 轉真人
+            return BackendResponse(
+                text="",
+                images=[],
+                CallCS=1,
+                trace={"fatal_error": str(e), "handoff_reason": "fatal_error_repeat"},
+            )
+        return BackendResponse(
+            text=RETRY_CANNED,
+            images=[],
+            CallCS=0,
+            trace={"fatal_error": str(e)},
+        )
 
     # 提取最終的 AI 回應
     final_ai_message_content = "抱歉，目前無法回覆。"
@@ -619,6 +654,18 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
     # 清理文字（移除圖片 URL）
     clean_text = clean_text_from_urls(final_ai_message_content, extracted_urls)
     clean_text = strip_markdown(clean_text)   # 去 markdown 記號，讓 Messenger/LINE 顯示乾淨
+
+    # 依後端契約，message_history 裡「真人客服」講的話都帶 "[真人客服] " 前綴（見 main_webhook 說明），
+    # 那是給 AI 辨識講者用的內部標記。當一通對話真人介入很多次時，AI 會「模仿」這個格式、
+    # 把前綴一起寫進自己的回覆開頭 → 客人就會看到「[真人客服] 您好…」。
+    # 只在「回覆真的帶了前綴」時才移除（正常回覆完全不動），並印 log 以便統計實際發生頻率。
+    # 只處理開頭（可能連續多個），不動內文，避免誤傷「轉接真人客服」這類正常語句。
+    if clean_text.lstrip().startswith("[真人客服]"):
+        print(
+            f"⚠️ AI 回覆誤帶 [真人客服] 前綴，已移除 "
+            f"fb_account={user_input.fb_account}"
+        )
+        clean_text = re.sub(r"^\s*(?:\[真人客服\]\s*)+", "", clean_text)
 
     # CallCS=1（客人主動找真人）→ 清空 text/images，純通知後端轉接
     # CallCS=2（預約流程）→ 保留 AI 的預約引導文字、清空 images，後端先發文字再通知客服
