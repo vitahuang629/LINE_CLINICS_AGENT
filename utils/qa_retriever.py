@@ -8,7 +8,19 @@ import pickle
 import pandas as pd
 import jieba
 from utils.shared_resources import embedding_model, chinese_tokenizer
+from utils.index_cache import (
+    source_fingerprint,
+    chroma_marker_path,
+    bm25_marker_path,
+    is_fresh,
+    write_marker,
+    clear_dir_contents,
+)
 from typing import List
+
+# 改了下面 Document 的組法（欄位、加權重複次數…）就把這個字串 +1，
+# 讓現有索引即使 CSV 沒動也會被判定為過期而重建。
+INDEX_LOGIC_VERSION = "1"
 
 
 def reciprocal_rank_fusion(*ranked_lists, k=60) -> List[str]:
@@ -71,21 +83,31 @@ def get_qa_retriever(
         )
 
 
-    if not os.path.exists(persist_dir):
+    # 守門條件是「來源指紋相符」而不是「目錄存在」：
+    # 空目錄（bind mount 首次掛載）與 CSV 更新後的舊索引都會被判定為過期而重建。
+    fingerprint = source_fingerprint(csv_path, INDEX_LOGIC_VERSION)
+
+    # --- Vector store (Chroma) ---
+    chroma_marker = chroma_marker_path(persist_dir)
+    if is_fresh(chroma_marker, fingerprint):
+        vectorstore = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embedding_model
+        )
+    else:
+        # 只清內容、保留目錄本身（它可能是 bind mount 的掛載點，刪不得）
+        clear_dir_contents(persist_dir)
         vectorstore = Chroma.from_documents(
             documents=qa_documents_vector,
             embedding=embedding_model,
             persist_directory=persist_dir
         )
-    else:
-        vectorstore = Chroma(
-            persist_directory=persist_dir,
-            embedding_function=embedding_model
-        )
+        write_marker(chroma_marker, fingerprint)  # 建成功才寫，中途掛掉不留假標記
     vector_retriever = vectorstore.as_retriever(search_kwargs={"k": k})
 
     # --- BM25 retriever ---
-    if os.path.exists(bm25_path):
+    bm25_marker = bm25_marker_path(bm25_path)
+    if is_fresh(bm25_marker, fingerprint) and os.path.exists(bm25_path):
         with open(bm25_path, "rb") as f:
             bm25_retriever = pickle.load(f)
     else:
@@ -94,6 +116,7 @@ def get_qa_retriever(
         )
         with open(bm25_path, "wb") as f:
             pickle.dump(bm25_retriever, f)
+        write_marker(bm25_marker, fingerprint)
     # 快取的 pickle 會把舊的 k 一起帶回來 → 載入後強制覆寫，確保 k 生效（不必刪快取重建）
     bm25_retriever.k = k
 

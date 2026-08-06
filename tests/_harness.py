@@ -67,11 +67,31 @@ _JUDGE_SYSTEM = (
 )
 
 
-def judge_answer(question: str, reference: str, ai_answer: str) -> dict:
-    """reference-based LLM 評審，回傳 {'verdict': ..., 'reason': ...}。"""
+def judge_answer(question: str, reference: str, ai_answer: str, history=None) -> dict:
+    """reference-based LLM 評審，回傳 {'verdict': ..., 'reason': ...}。
+
+    history（選填）：[{"type": "human"|"ai", "content": ...}]，舊→新。
+    不給的話評審只看得到單句問題 —— 但 AI 當初是看著整段對話回答的，
+    「有沒有接住上文」「代名詞指誰」在無上下文的情況下根本判不準。
+    參數選填是為了不動既有呼叫端；新的呼叫請盡量把 history 帶上。
+    """
     from langchain_openai import ChatOpenAI
 
+    hist_text = ""
+    if history:
+        turns = "\n".join(
+            f"{'客人' if h.get('type') == 'human' else '客服'}："
+            f"{(h.get('content') or '').replace('[真人客服] ', '')}"
+            for h in history
+        )
+        hist_text = (
+            "【先前對話（舊→新，AI 回答時看得到）】\n"
+            f"{turns}\n\n"
+            "※ AI 沒有重複上文已經講過的內容不扣分；客人用代名詞（這個／它）時請依上下文判斷所指。\n\n"
+        )
+
     user = (
+        f"{hist_text}"
         f"【客人問題】\n{question}\n\n"
         f"【真人參考答案】\n{reference or '（此題真人沒有回覆／對話結束，請僅依費用表與常識判斷 AI 回覆是否合理）'}\n\n"
         f"【診所費用表】\n{fees_text()}\n\n"

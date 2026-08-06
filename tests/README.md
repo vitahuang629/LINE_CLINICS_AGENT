@@ -8,10 +8,24 @@
 |---|---|
 | `fees.py` | 費用表 —— 改體驗價數字就改這 |
 | `cases.yaml` | 回歸題庫 —— 「答對的特徵」都存這 |
-| `test_regression.py` | pytest 回歸測試,改完 code 跑這個 |
+| `test_regression.py` | pytest 回歸測試,改完 code 跑這個(**會呼叫 OpenAI、花錢**) |
+| `test_clinic_info.py` | 分店地址/停車的回歸測試(**離線、不呼叫 OpenAI**,3 秒跑完) |
 | `replay.py` | 建題庫工具:把 `test_reply.txt` 的對話丟給 AI 跑一遍、跟真人答案並排 |
 | `_harness.py` | 共用核心(組 request / 跑 AI / 驗特徵) |
 | `../test_reply.txt` | 你收集的真實對話原始檔 |
+
+## 先跑免費的那個
+
+`test_clinic_info.py` 不呼叫 OpenAI(分店地址/停車走的是確定性查表,中間沒有 LLM),
+所以可以無腦常跑,改完 code 先跑它擋掉低級錯誤,再決定要不要花錢跑 `test_regression.py`：
+
+```powershell
+$env:PYTHONUTF8=1
+poetry run pytest tests/test_clinic_info.py -v      # 約 3 秒、0 元
+```
+
+它守三件事:①該直出的有直出且分店正確 ②**療程問題不可以被誤判成問地點**
+③查表資料還在(`data/clinic_branch_info.csv` 被搬走時會先紅,而不是線上安靜失效)。
 
 ## ⚠️ 執行前提
 

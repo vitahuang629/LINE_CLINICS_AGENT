@@ -12,8 +12,16 @@ services:
       - "8004:8004"
     env_file:
       - .env                     # runtime 才注入 .env（不會包進 image）
-    # 如果之後想讓療程資料可獨立更新（不重 build），把下面 mount 打開：
-    # volumes:
-    #   - ./data:/app/data
-    #   - ./chroma_token_split:/app/chroma_token_split
-    #   - ./chroma_qa:/app/chroma_qa
+    volumes:
+      # 向量索引存到容器外，重啟不必重跑 OpenAI embedding。
+      # 每個 collection 一個目錄，三個都要掛（漏掉的那個每次啟動還是會重建）。
+      # 新鮮度由 utils/index_cache.py 的來源指紋把關：data/*.csv 一改就自動重建，
+      # 所以掛了 volume 也不會有舊索引上線的問題。
+      - ./chroma_clinic_qa:/app/chroma_clinic_qa
+      - ./chroma_treatment_qa:/app/chroma_treatment_qa
+      - ./chroma_token_split:/app/chroma_token_split
+      # BM25 的 pickle 刻意不掛：它只是 jieba 斷詞，沒有 API 呼叫，重建成本趨近於零，
+      # 而 bind mount 單一檔案在 host 端檔案不存在時 Docker 會建成「目錄」，反而是坑。
+      #
+      # 如果之後想讓療程資料可獨立更新（不重 build），再把下面打開：
+      # - ./data:/app/data
