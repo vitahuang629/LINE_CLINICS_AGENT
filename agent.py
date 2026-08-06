@@ -22,6 +22,33 @@ OUR_TREATMENTS_LINE = "、".join(
     "／".join(sorted(group)) for group in TREATMENT_SYNONYMS
 )
 
+# qa_treatment 的合法值域（與上面的白名單不同，見 toolkits.TREATMENT_QA_CATEGORIES 的說明）。
+# planner 被要求「原封不動輸出這裡的其中一個字串」，把「客人怎麼稱呼療程」的模糊比對
+# 交給 LLM 做——它本來就擅長這個——下游拿到的就是精確值，不必再維護別名表。
+QA_TREATMENT_LINE = "、".join(TREATMENT_QA_CATEGORIES)
+
+
+def _canonical_qa_category(name):
+    """把 planner 回的療程名收斂成 treatment_qa 實際的 category；對不上回 ""。
+
+    planner 已被 prompt 要求原封不動輸出清單中一項，這裡是兜底：
+      1. 大小寫／空白差異 → 放寬比對
+      2. 只給了片段（如只回「野馬波」而非「AlmaDUO 野馬波」）→ 子字串雙向比對
+      3. 真的不在清單裡（外院療程、或我方但沒有 QA 資料的療程如 EMBODY）→ 回 ""，
+         讓下游走歷史回補，而不是硬塞一個必然撈空的值進檢索。
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return ""
+    for c in TREATMENT_QA_CATEGORIES:
+        if n == c.lower():
+            return c
+    for c in TREATMENT_QA_CATEGORIES:
+        cl = c.lower()
+        if n in cl or cl in n:
+            return c
+    return ""
+
 # 對話歷史改由後端在每次 request 的 messages 欄位傳入，不再使用 LangGraph checkpointer
 
 def get_latest_human_message(messages):
@@ -69,8 +96,13 @@ def trim_history(messages, max_msgs):
 
 
 # ── 診所分店靜態資訊：確定性「原文直出」，答案 100% 來自 CSV、不經 LLM 生成，杜絕地址幻覺 ──
-_CLINIC_PARKING_KW = ("停車", "開車", "停車場")
-_CLINIC_LOCATION_KW = ("地址", "在哪", "哪裡", "位置", "怎麼去", "怎麼走", "怎麼到", "地點", "門牌", "怎麼過去", "怎麼到達")
+_CLINIC_PARKING_KW = ("停車", "開車", "停車場", "車位", "好停")
+_CLINIC_LOCATION_KW = ("地址", "在哪", "哪裡", "位置", "怎麼去", "怎麼走", "怎麼到", "地點", "門牌", "怎麼過去", "怎麼到達",
+                       # 問路的常見講法：這份表就是「什麼時候會直出」的完整定義，
+                       # 想知道會不會被接管，讀這裡就好；漏掉的講法會落到 react agent，
+                       # 那條路也查得到 CSV 原文（toolkits.lookup_branch_info），不會編地址。
+                       # ⚠️ 不要放單獨的「走路」：「做完走路會不會痛」是療程問題，會被誤接管。
+                       "交通", "捷運", "公車", "高鐵", "客運", "出口", "導航", "地圖", "走過去", "步行")
 _CLINIC_HOURS_KW = ("看診時間", "營業時間", "門診時間", "幾點")
 _CLINIC_PHONE_KW = ("電話", "聯絡電話", "市話")
 _CLINIC_BRANCH_ASK = "請問您想了解哪一間"   # 反問哪一間分店的固定句指紋（供後續辨識客人在回答分店）
@@ -102,17 +134,6 @@ def _resolve_qa_treatment_from_history(messages):
     return None
 
 
-def _treatment_group(name):
-    """回傳含 name 的 TREATMENT_SYNONYMS 群組（別名 set）；找不到就回 {name}。"""
-    low = (name or "").lower()
-    if not low:
-        return set()
-    for group in TREATMENT_SYNONYMS:
-        if any(a.lower() in low or low in a.lower() for a in group):
-            return group
-    return {name}
-
-
 def _cat_matches_group(cat, group):
     """treatment_qa 的 category 是否對應到某療程別名群組（大小寫／子字串寬鬆比對）。"""
     c = (cat or "").strip().lower()
@@ -142,9 +163,14 @@ def _clinic_branch(text):
 def clinic_info_direct_answer(messages):
     """診所靜態資訊（地址/停車/看診/電話）→ 回傳「原文直出」的答案字串；非此類問題回 None（交給 booking 的 react agent）。
 
-    - 分店 + 主題都判斷得出 → 直接回 clinics_qa 該筆答案（原文，不經 LLM，地址不可能幻覺）。
+    - 分店 + 主題都判斷得出 → 直接回該筆答案（原文，不經 LLM，地址不可能幻覺）。
     - 有主題但沒指明分店 → 回固定句反問「台北還是竹北」。
     - 客人上一輪被問「哪一間」、這輪只回分店名 → 回頭找原主題再直出。
+
+    ⚠️ 判斷刻意維持「關鍵字表」而非 LLM：主題一被判成非空，這輪就會被本函式接管
+    （沒分店時還會直接回反問句），誤判的代價是整輪被劫走。關鍵字表雖然列不全，
+    但「什麼時候會觸發」讀表就知道，可預測、可回歸測試；漏掉的講法會落到
+    react agent，那條路現在也拿得到 CSV 原文（見 toolkits.lookup_branch_info），不會編地址。
     """
     cur = get_latest_human_message(messages)
     cur = cur[0]["text"] if isinstance(cur, list) else (cur or "")
@@ -605,9 +631,14 @@ class DoctorAppointmentAgent:
                  此時 qa_treatment 填**上文正在談的我方療程**（對照文末白名單，不是填外院療程名），
                  qa_query 寫成比較問句，例：「跟電波、音波有什麼不一樣」。
 
-            6. qa_treatment：need_qa=true 時，這個問題是針對**哪個療程**（從本輪或上文判斷，
-               例：冷凍減脂、SIS、Emface、瘦瘦針）。判斷不出來則回空字串 ""。
-               - 客人用代名詞（「這個」「它」）時，往上文找最近在談的療程。
+            6. qa_treatment：need_qa=true 時，這個問題是針對**哪個療程**（從本輪或上文判斷）。
+               ⭐ **必須原封不動輸出文末【QA 療程清單】裡的其中一個字串**（一字不改，含空格與大小寫）。
+                  客人怎麼稱呼都由你負責對應到清單值，例：
+                  「almado」「想了解Alma」「Alma野馬波」「野馬波」→ 一律輸出 `AlmaDUO 野馬波`；
+                  「菲斯波」「emface」→ 輸出 `EMFACE`；「瘦瘦筆」→ 輸出 `瘦瘦針`。
+               - 客人用代名詞（「這個」「它」）時，往上文找最近在談的療程，再對應到清單值。
+               - 判斷不出來、或該療程**不在【QA 療程清單】裡**（含外院療程）→ 回空字串 ""。
+                 ⚠️ 不要自己造一個清單外的療程名，那會讓系統查不到資料。
 
             7. qa_query：need_qa=true 時，**客人的問題本身**（例：「有沒有修復期」「會不會復胖」「跟EMBODY差別」）。
                need_qa=false 時回 ""。
@@ -631,6 +662,12 @@ class DoctorAppointmentAgent:
                - 名字**不在清單裡**（玻尿酸、肉毒、埋線、電波拉皮、鳳凰電波、音波拉皮、海芙音波、
                  水光針、雷射除斑…）→ **外院療程**，不可拿來當 search_query 或 qa_treatment，
                  因為我們的資料庫查不到它們。
+
+            【QA 療程清單】（qa_treatment 只能填這裡面的字串，一字不改；填不出來就回 ""）
+            {QA_TREATMENT_LINE}
+
+            ⚠️ 這份比上面的白名單「窄」：白名單裡有些療程沒有問答資料，
+               填了也查不到，那種情況 qa_treatment 一律回 ""。
         """
         messages_for_planner = [{"role": "system", "content": planner_prompt}] + state["messages"]
         plan = self.info_planner_model.with_structured_output(InfoPlan).invoke(messages_for_planner)
@@ -740,7 +777,11 @@ class DoctorAppointmentAgent:
         #    療程名 + 問題一起查，才分得出是哪個療程的答案。
         # planner 判 need_qa 但沒判出 qa_treatment（代名詞/上下文沒解析到）→ 從歷史確定性回補，
         # 否則像「你們是計算發數嗎」這種無主詞問句會整個跳過 QA 檢索、Composer 只能憑空回答。
-        qa_treatment = (plan.get("qa_treatment") or "").strip()
+        # planner 已被要求輸出 TREATMENT_QA_CATEGORIES 裡的原字串；這裡收斂兜底，
+        # 對不上就當作沒判出來（回 ""），交給下方的歷史回補，不硬帶一個查不到的療程名進檢索。
+        qa_treatment = _canonical_qa_category(plan.get("qa_treatment"))
+        if (plan.get("qa_treatment") or "").strip() and not qa_treatment:
+            print(f"[treatment_qa] planner 回的療程 {plan.get('qa_treatment')!r} 不在 QA 清單 → 視為未判出")
         qa_group = None            # 回補時鎖定的療程別名群組（供下方 category 防呆）
         used_qa_fallback = False
         if plan.get("need_qa") and not qa_treatment:
@@ -759,7 +800,10 @@ class DoctorAppointmentAgent:
             boosted = f"{qa_q} {t}".strip()
             qa_docs = treatment_qa_retriever.get_relevant_documents(boosted)   # k=6，見 toolkits
             # 依 category 過濾成「本療程」的候選，取排序最前那筆——同療程多筆時才挑得到真正對到問題的。
-            target_group = qa_group or _treatment_group(t)
+            # planner 路徑：t 已收斂成 CSV 的 category 原值 → 直接用它比對，不必再繞別名表
+            # （繞一圈的話，別名表跟 CSV 只要有一點不一致就會過濾失效）。
+            # 回補路徑：t 來自 TREATMENT_SYNONYMS，仍用該別名群組比對。
+            target_group = qa_group or {t}
             matched = [d for d in qa_docs
                        if _cat_matches_group((d.metadata or {}).get("category", ""), target_group)]
             if matched:
@@ -854,10 +898,7 @@ class DoctorAppointmentAgent:
 
             🚨 **療程名稱白名單（絕對重要）** 🚨
             本診所**只提供**以下療程，**絕對不可以**推薦或提及白名單以外的任何療程：
-            【體雕類】NEO（熱磁減脂）、EMBODY、冷凍減脂（冷脈衝）、SIS、瘦瘦筆（週纖達）
-            【臉部類】Emface（菲斯波）、無限電波、皮秒（PicosurePRO）
-            【私密處類】Alma Duo（震波）、FemiLift、G動椅（Emsella）
-            【睡眠/自律神經類】腦波機（DeepTMS）、EECP、PBM 紅光、NightLase 止鼾雷射
+            """ + TREATMENT_WHITELIST_LINES + """
 
             ❌ **絕對禁止**提到我們沒有的療程：射頻緊緻、微針療法、肉毒、玻尿酸、電波拉皮、音波拉皮、
                雷射除斑、皮秒雷射、CO2 雷射、淨膚雷射、果酸換膚、水光針，或任何不在上述白名單的療程。

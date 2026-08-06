@@ -331,3 +331,15 @@
     call_cs: 0
     text_contains_any: ["醫師", "評估", "諮詢"]
     text_not_contains: ["可以做", "沒問題", "不影響"]
+
+# 【20】客人用非正式寫法指名療程（「almado」不是任何一份清單裡的字串）→
+#      planner 必須自己收斂成 treatment_qa 的 category 原值「AlmaDUO 野馬波」，
+#      QA 才撈得到「發數」那筆（答案：原廠設定單次為 1500 發）。
+#      這題守的是「療程別名 / 清單由 clinics_introductions3.csv 產生」這條路：
+#      別名表若再度漂掉，planner 收斂不出來 → QA 整段被跳過 → 沒有 1500 → 紅。
+- name: 野馬波_客人寫almado_問發數_答1500
+  input:
+    content: "想了解almado，一次打幾發？"
+  expect:
+    call_cs: 0
+    text_contains: ["1500"]

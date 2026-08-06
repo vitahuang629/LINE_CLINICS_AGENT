@@ -13,6 +13,19 @@ from langchain.schema import Document
 from pydantic import Field
 from langchain_openai import OpenAIEmbeddings
 from utils.shared_resources import embedding_model, chinese_tokenizer
+from utils.index_cache import (
+    source_fingerprint,
+    chroma_marker_path,
+    bm25_marker_path,
+    is_fresh,
+    write_marker,
+    clear_dir_contents,
+)
+
+CSV_PATH = "data/clinics_introductions3.csv"
+
+# 改了下面 Document 的組法就把這個字串 +1，強制重建現有索引。
+INDEX_LOGIC_VERSION = "1"
 
 
 
@@ -61,7 +74,7 @@ from utils.shared_resources import embedding_model, chinese_tokenizer
 
 def get_ensemble_retriever():
     # 讀取數據
-    doc = pd.read_csv("data/clinics_introductions3.csv", encoding="big5")
+    doc = pd.read_csv(CSV_PATH, encoding="big5")
     # print(doc)
 
     documents_for_vector = []
@@ -98,29 +111,37 @@ def get_ensemble_retriever():
         )
 
     persist_dir = "./chroma_token_split"  # 你要存放資料庫的資料夾路徑
+    bm25_path = "./bm25.pkl"
 
-    #如果這段重複執行, 會造成retriever重複, 第一次使用就好
-    if not os.path.exists(persist_dir):
+    # 守門條件是「來源指紋相符」而不是「目錄存在」：
+    # 空目錄（bind mount 首次掛載）與 CSV 更新後的舊索引都會被判定為過期而重建。
+    fingerprint = source_fingerprint(CSV_PATH, INDEX_LOGIC_VERSION)
+
+    chroma_marker = chroma_marker_path(persist_dir)
+    if is_fresh(chroma_marker, fingerprint):
+        print("✅ 向量索引為最新，略過建立步驟")
+        vectorstore = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embedding_model
+        )
+    else:
+        print("🚧 向量索引不存在或已過期，重新建立")
+        # 只清內容、保留目錄本身（它可能是 bind mount 的掛載點，刪不得）
+        clear_dir_contents(persist_dir)
         vectorstore = Chroma.from_documents(
             documents=documents_for_vector,
             embedding=embedding_model,
             persist_directory=persist_dir
         )
-    else:
-        print("✅ 資料庫已存在，略過建立步驟")
-        vectorstore = Chroma(
-            persist_directory=persist_dir,
-            embedding_function=embedding_model
-        )
+        write_marker(chroma_marker, fingerprint)  # 建成功才寫，中途掛掉不留假標記
 
     # 之後想用 retriever，就從本地載入
     vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
 
     # 建立/載入 BM25 keyword retriever（使用快取）
-    bm25_path = "./bm25.pkl"
-
-    if os.path.exists(bm25_path):
+    bm25_marker = bm25_marker_path(bm25_path)
+    if is_fresh(bm25_marker, fingerprint) and os.path.exists(bm25_path):
         print("✅ 載入快取的 BM25 Retriever")
         with open(bm25_path, "rb") as f:
             keyword_retriever = pickle.load(f)
@@ -129,6 +150,7 @@ def get_ensemble_retriever():
         keyword_retriever = BM25Retriever.from_documents(documents_for_keyword, preprocess_func=chinese_tokenizer,k = 3)
         with open(bm25_path, "wb") as f:
             pickle.dump(keyword_retriever, f)
+        write_marker(bm25_marker, fingerprint)
 
 
     ensemble_retriever = EnsembleRetriever(retrievers = [vector_retriever, keyword_retriever], weights = [0.3, 0.7])

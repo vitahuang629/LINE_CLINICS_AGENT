@@ -16,7 +16,8 @@
   - **防幻覺機制**：療程白名單 + 費用工具化（`get_treatment_fee`）+ 輸出端價格守門，AI 只能依檢索結果與資料庫費用回覆
   - **圖片處理**：自動 OCR 辨識使用者上傳圖片，並依回覆內容帶出對應療程／對比照
   - **預約與轉真人**：整理預約資訊並通知管理群組，必要時觸發轉接真人客服（CallCS）
-  - **通道無關核心**：LangGraph agent 與 I/O 接層解耦，目前對外為 FB Messenger `/chat` API；LINE 接層程式碼保留待啟用
+  - **通道無關核心**：LangGraph agent 與 I/O 接層解耦，目前對外為 FB Messenger `/chat` API；
+    LINE 接層的實作已移除，`main_webhook.py` 僅保留註解掉的路由骨架
 
   ---
 
@@ -48,23 +49,80 @@
   - Python 3.11
   - 建議使用虛擬環境 `venv`（或 Poetry）
   - 需設定 `.env`（OpenAI API Key 等，不會進版控）
+  - 部署另需 Docker / Docker Compose
+
+  ---
+
+  ## 部署（Docker）
+
+  ```bash
+  docker compose up -d --build
+  ```
+
+  - 服務跑在 `:8004`，對外只有 `POST /chat`
+  - FastAPI 設了 `root_path="/fb-clinics-agent"`（`main_webhook.py:7`），
+    所以掛在反向代理後面時實際路徑是 **`/fb-clinics-agent/chat`**；直接打容器則是 `/chat`
+  - `.env` 由 `env_file` 在 runtime 注入，**不會包進 image** —— 部署到新機器時要手動放一份
+  - 容器啟動時先用單一進程 warmup 建好索引，再開 2 個 uvicorn worker
+    （避免兩個 worker 同時往同一個 Chroma 目錄寫入）
+
+  ### volume 掛載
+
+  `docker-compose.yml` 把三個向量庫目錄掛到容器外，重啟就不必重跑 embedding：
+
+  ```yaml
+  volumes:
+    - ./chroma_clinic_qa:/app/chroma_clinic_qa
+    - ./chroma_treatment_qa:/app/chroma_treatment_qa
+    - ./chroma_token_split:/app/chroma_token_split
+  ```
+
+  **三個都要掛** —— 漏掉的那個每次啟動都會重新呼叫一次 embedding API。首次部署時目錄是空的，
+  會自動建一次索引（服務就緒約 30 秒），之後啟動約 15 秒。
+
+  BM25 的 pickle 刻意不掛：它只是 jieba 斷詞、沒有 API 呼叫，重建成本趨近於零，
+  而 bind mount 單一檔案在 host 端檔案不存在時 Docker 會建成「目錄」，反而是坑。
+
+  > 此設定假設 host 有持久的檔案系統（VM + docker compose）。若改用 Cloud Run / Fargate
+  > 這類無狀態容器平台，bind mount 不會生效，每次冷啟都會重建索引。
 
   ---
 
   ## 資料搜尋比對
-  本專案使用 Retriever 結合兩種檢索方式：
 
-  1. **向量檢索（Vector Retriever）**
-     使用 Chroma + OpenAI Embeddings 將診所療程 CSV 資料轉成向量，搜尋最相關的療程內容，
-     存放於 `./chroma_token_split`，第一次建立後會快取。
+  檢索分成**三組獨立索引**，各吃不同的 CSV。分開建是為了避免不同領域的資料灌進同一個索引
+  互相污染排名 —— 例如「效果如何」這種問題在每個療程底下都成立，混在一起就分不出是哪一筆。
+  每組都是「向量 + BM25」的 hybrid：
 
-  2. **關鍵字檢索（BM25 Keyword Retriever）**
-     使用 BM25 演算法對療程的 `name`、`suitable_for`、`keywords` 欄位加權搜尋，
-     `suitable_for` 欄位加權三倍以提高匹配度，使用 pickle 快取於 `bm25.pkl`，第二次執行直接載入快取。
+  | 索引 | 來源 CSV | 向量庫 | BM25 快取 | 權重（向量 : 關鍵字） |
+  |---|---|---|---|---|
+  | 療程介紹 | `clinics_introductions3.csv` | `chroma_token_split/` | `bm25.pkl` | 0.3 : 0.7 |
+  | 療程 QA | `treatment_qa.csv` | `chroma_treatment_qa/` | `bm25_treatment_qa.pkl` | 0.7 : 0.3 |
+  | 診所 QA | `clinics_qa.csv` | `chroma_clinic_qa/` | `bm25_clinic_qa.pkl` | 0.7 : 0.3 |
 
-  最後將 Vector Retriever 與 BM25 Keyword Retriever 以權重 **[0.3, 0.7]** 組合，更偏向關鍵字匹配。
+  - **向量檢索**：Chroma + OpenAI `text-embedding-3-small`
+  - **關鍵字檢索**：BM25 + jieba 中文斷詞。建索引時把特定欄位重複寫入以加權
+    （療程介紹的 `suitable_for` ×3；QA 的 `keywords` ×3、`category` ×2）
 
-  > ⚠️ 若更新了療程 CSV 內容，需刪除 `bm25.pkl` 與 `chroma_token_split/` 讓索引重建，否則會載入舊快取。
+  權重方向不同是刻意的：療程介紹偏重關鍵字（0.7），因為使用者多半直接說出症狀詞；
+  QA 偏重語意（0.7），因為同一個問題有很多種問法。
+
+  ### 分店交通／停車：刻意不進 RAG
+  `data/clinic_branch_info.csv` 走 `lookup_branch_info()` 靜態查表，**不建進任何索引**。
+  「哪一家店、怎麼去、能不能停車」是事實型問題，用檢索很容易撈到隔壁分店的答案，查表才能保證對。
+
+  ### 索引快取與更新
+  索引由 `utils/index_cache.py` 以**來源指紋**（CSV 內容的 SHA-256 + 建索引邏輯版本）把關：
+
+  | 情況 | 行為 |
+  |---|---|
+  | CSV 沒變 | 直接載入現有索引，不呼叫 embedding API |
+  | CSV 有改 | 自動偵測並重建 —— **不需要手動刪快取** |
+  | 索引目錄是空的（如 Docker volume 首次掛載） | 視為過期並重建，避免載入空 collection 後檢索靜默回 0 筆 |
+
+  > ⚠️ 指紋只涵蓋 CSV 內容。如果你改的是 `Document` 的**組法**（欄位、加權重複次數）而 CSV 沒動，
+  > 指紋不會變、索引不會重建。這時要把 `utils/qa_retriever.py` 或 `utils/ensemble_retriever.py` 裡的
+  > `INDEX_LOGIC_VERSION` 字串 +1 才會強制重建。
 
   ---
 
