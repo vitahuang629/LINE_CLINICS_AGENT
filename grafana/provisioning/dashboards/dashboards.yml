@@ -1,0 +1,16 @@
+# 讓 Grafana 啟動時自動載入 /var/lib/grafana/dashboards 底下的儀表板 JSON。
+# 檔案是唯讀掛載，所以在 UI 上改動不會寫回檔案 —— 想永久修改請改 repo 裡的 JSON 再重啟容器。
+
+apiVersion: 1
+
+providers:
+  - name: clinic-dashboards
+    orgId: 1
+    folder: AI 客服
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30    # 改完 JSON 存檔，30 秒內自動生效，不用重啟容器
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

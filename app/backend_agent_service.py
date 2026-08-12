@@ -8,10 +8,17 @@ from .models import BackendUserQuery, BackendResponse
 from agent import DoctorAppointmentAgent
 # from utils.profile_db import get_user_profile_by_uuid
 from typing import List
+from time import perf_counter
 import requests
 import re
+# token 用量統計：contextvar 型的 callback，已實測會穿透 LangGraph 節點與巢狀子圖
+# （booking 的 create_react_agent），所以 graph 內外所有 OpenAI 呼叫都算得到。
+from langchain_community.callbacks import get_openai_callback
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
+# 逾時設定集中在 utils/llms.py（那裡有為什麼一定要設的完整說明）。
+# 本檔下面三處是繞過 LLMModel、直接建 ChatOpenAI 的呼叫，同樣要帶上，否則會是無限等待。
+from utils.llms import LLM_TIMEOUT, LLM_MAX_RETRIES
 
 agent = DoctorAppointmentAgent()
 
@@ -180,7 +187,12 @@ def ocr_image_with_llm(image_url: str) -> str:
     """
     try:
         # 使用獨立的 LLM 實例，確保不帶入醫美的 System Prompt
-        ocr_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        ocr_llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0,
+            timeout=LLM_TIMEOUT,
+            max_retries=LLM_MAX_RETRIES,
+        )
         messages = [
             HumanMessage(content=[
                 {"type": "text", "text": (
@@ -295,7 +307,12 @@ def identify_treatments_from_context(
         f"{', '.join(keyword_pool)}"
     )
     try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0,
+            timeout=LLM_TIMEOUT,
+            max_retries=LLM_MAX_RETRIES,
+        )
         response = llm.invoke([HumanMessage(content=prompt)])
         text = (response.content or "").strip()
         if not text or text.upper() == "NONE":
@@ -386,7 +403,12 @@ def _rewrite_price_reply(draft: str, treatments: list, relevant_fees: list, leak
         "只輸出最終要給客人的純文字，不要任何解釋。"
     )
     try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0,
+            timeout=LLM_TIMEOUT,
+            max_retries=LLM_MAX_RETRIES,
+        )
         resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=draft)])
         return (resp.content or "").strip() or draft
     except Exception as e:
@@ -412,9 +434,12 @@ from toolkit.toolkits import (
 _OPTION_WORDS = ("單點", "雙點", "多點", "單次", "套裝", "組合", "方案", "堂", "部位", "療程方案")
 
 
-def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
+def _execute_backend_agent_inner(user_input: BackendUserQuery) -> BackendResponse:
     """
     執行 Agent 並回傳結構化的回應
+
+    ⚠️ 這是內層實作，外部請呼叫 execute_backend_agent（它會在 trace 補上
+       usage / elapsed_ms / grounding_* 三組觀測欄位，並印出 📤 log）。
 
     Args:
         user_input: 包含 fb_account、本輪 content / image_url、以及 message_history
@@ -520,9 +545,41 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
 
     # 執行 Agent（不使用 checkpointer，歷史由後端在 messages 內傳入）
     config = {
-        "configurable": {
-            "recursion_limit": 20
-        }
+        # recursion_limit 算的是「單次 invoke 內 graph 走了幾個 super-step」，
+        # 跟對話輪數／message_history 長度無關（本服務 stateless，每次 /chat 都是全新 invoke）。
+        #
+        # 外層 graph 是無環 DAG（start→guard→supervisor→information/booking→moderator→END），
+        # 最長 5 步，根本碰不到上限。真正會迴圈的是 booking_node 裡的 create_react_agent
+        # （model→tools→model→…，每輪 tool call 約吃 2 步），這個值實際上是在管它。
+        # 內層子圖會透過 contextvar 繼承這裡的值，即使 booking_agent.invoke() 沒傳 config。
+        #
+        # ⚠️ 一定要放**頂層**。放進 "configurable" 會被當成一般 configurable 值忽略，
+        #    實際套用的是預設 25 —— 舊寫法就是這樣，設的 20 完全沒生效。
+        #
+        # 取 12（≈5~6 輪 tool call）而非預設 25 的理由：LLM 呼叫已設 60 秒 timeout
+        # （見 utils/llms.py），25 步最壞情況會讓單一 request 拖到十幾分鐘、
+        # 期間一直佔著一條 threadpool thread，而客人早就走了。
+        # 撞到上限本來就代表這通已經歪了，早點丟 GraphRecursionError 讓下面的 🛡️ 兜底接手
+        # （回罐頭 → 再崩才轉真人）反而比較好，也省 token。
+        "recursion_limit": 12,
+
+        # ─── LangSmith 觀測用 ───────────────────────────────────────────
+        # 沒有 metadata 就只能一筆一筆點開看 trace，無法分群比較。
+        # 這幾個維度是用來回答「什麼樣的請求特別貴／特別慢」——
+        # 實務上 token 大戶不是問題本身（客人一句話能多長），而是
+        # ①history_len 累積的對話 ②檢索塞進 prompt 的 chunk 量，所以優先記這些。
+        # ⚠️ 不要放 content 本文或任何個資：trace 的 inputs 本來就存得到，
+        #    metadata 是拿來當篩選維度的，重複塞進去只是讓列表變難讀。
+        "run_name": "clinic_chat",
+        "metadata": {
+            "history_len": len(user_input.message_history),
+            "has_image": bool(user_input.image_url),
+            "image_count": len(user_input.image_url),
+            "ocr_text_len": sum(len(t) for t in ocr_texts),
+            "ad_referral": user_input.ad_referral or "",
+            "is_first_turn": not user_input.message_history,
+            "fee_table_size": len(user_input.treatment_fees or []),
+        },
     }
     # 🛡️ 兜底：graph 執行期間任何未預期例外（工具參數驗證失敗、OpenAI 抽風/逾時、
     #    recursion limit…）都在此接住，避免整個 request 變成 HTTP 500、客人已讀不回。
@@ -703,11 +760,83 @@ def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
         trace=trace,
     )
 
-    # 印出「真正回傳給後端的完整內容」（含 trace 全部）供 Portainer log 對照
+    # 📤 log 已移到外層 execute_backend_agent —— 那裡才拿得到 usage / elapsed_ms，
+    # 而且四條 return 路徑都會印到（以前只有這條正常回覆會印）。
+    return response_body
+
+
+def _flatten_strings(value) -> List[str]:
+    """把 grounding 攤平成字串清單。
+
+    形狀不固定：moderator 寫入時可能是 `sorted(grounded)` 的扁平字串清單，
+    也可能是 `[grounded]` 這種把整個 list 再包一層的巢狀結構（見 agent.py:1382）。
+    遞迴攤平、只收字串，避免統計時因為形狀不同而少算。
+    """
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        out: List[str] = []
+        for v in value:
+            out.extend(_flatten_strings(v))
+        return out
+    return []
+
+
+def execute_backend_agent(user_input: BackendUserQuery) -> BackendResponse:
+    """
+    對外入口：跑 agent，並在 trace 補上「成本與效能」三組觀測欄位。
+
+    為什麼包一層、而不是寫在 _execute_backend_agent_inner 裡面：
+    那支函式有四個 return 出口（純圖片短路、graph 崩潰回罐頭、崩潰後轉真人、正常回覆），
+    在外層量一次才能保證每條路徑都涵蓋到。尤其「純圖片短路」那條也跑了 OCR、
+    是有 token 成本的，漏掉它成本統計就會系統性偏低。
+
+    這三個欄位是**成本與效能**維度，跟既有的品質維度（handoff_reason / moderator.fact_check /
+    draft vs final）互補；真正有用的分析多半在兩者交叉的地方。
+    """
+    t0 = perf_counter()
+    with get_openai_callback() as usage:
+        response_body = _execute_backend_agent_inner(user_input)
+
+    trace = dict(response_body.trace or {})
+
+    # ① 成本：input / output 分開記。本專案的成本幾乎全在 input
+    #    （system prompt + 最近 GEN_HISTORY_MSGS=30 則歷史 + grounding 原文），
+    #    output 只有幾百字 —— 要省錢得從「餵進去多少」下手，所以兩者要分開才有意義。
+    trace["usage"] = {
+        "total_tokens": usage.total_tokens,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        # 一輪打了幾次 LLM。booking 的 tool 迴圈會把這個數字墊高，
+        # 異常大的值 = 那通在 react agent 裡繞圈（對照 recursion_limit=12）。
+        "llm_calls": usage.successful_requests,
+        # 依 langchain 內建價目表估算；表上沒收錄的新模型會算成 0，別當帳單用。
+        "cost_usd": round(usage.total_cost, 6),
+    }
+
+    # ② 效能：伺服器端端到端耗時。
+    #    log 裡的 ⏱️ 在 Docker、trace 在後端 DB，兩邊沒有共同 key 可以 join；
+    #    要跟 route / usage 做交叉分析就得放進 trace。
+    trace["elapsed_ms"] = round((perf_counter() - t0) * 1000)
+
+    # ③ 原因變數：這輪塞了多少檢索原文進 prompt。
+    #    ① 和 ② 是「結果」，這個是用來分辨「貴是因為對話歷史長，還是檢索撈太多」——
+    #    兩者要動的旋鈕不同（agent.py 的 GEN_HISTORY_MSGS vs retriever 的 k）。
+    chunks = _flatten_strings(trace.get("grounding"))
+    trace["grounding_chunks"] = len(chunks)
+    trace["grounding_chars"] = sum(len(c) for c in chunks)
+
+    response_body.trace = trace
+
+    # 印出「真正回傳給後端的完整內容」（含 trace 全部）供 Portainer log 對照。
+    # 摘要放在第一行，這樣掃 log 時不用展開整包 JSON 就看得到成本與耗時。
     import json
+    from datetime import datetime
     print(
         f"📤 [{datetime.now().isoformat()}] Response to Backend "
-        f"fb_account={user_input.fb_account}\n"
+        f"fb_account={user_input.fb_account} "
+        f"tokens={usage.total_tokens} calls={usage.successful_requests} "
+        f"elapsed_ms={trace['elapsed_ms']} grounding_chars={trace['grounding_chars']}\n"
         + json.dumps(response_body.model_dump(), ensure_ascii=False, indent=2)
     )
 

@@ -133,6 +133,19 @@ FastAPI 透過 `root_path="/fb-clinics-agent"` 告訴自己處於前綴底下，
 | backend | `user_input` | 含圖片 OCR 文字在內的完整輸入 |
 | backend | `price_guard` | **只有價格守門啟動時**才有：`{leaked, allowed, reply_treatments, retried, resolved, handoff}` |
 | backend | `handoff_reason` | `customer_keyword` / `fact_check` / `price_fabrication` / `booking` / `null` |
+| backend | `usage` | `{total_tokens, prompt_tokens, completion_tokens, llm_calls, cost_usd}` — 本輪**所有** OpenAI 呼叫的加總（含 graph 內各節點、OCR、fee filter、價格守門重寫）|
+| backend | `elapsed_ms` | 伺服器端端到端耗時（毫秒）|
+| backend | `grounding_chunks` / `grounding_chars` | 本輪塞進 prompt 的檢索原文「段數」與「總字數」|
+
+上述後三組是**成本與效能**維度（其餘欄位是品質維度），四條 return 路徑都會帶，
+包含純圖片短路與 graph 崩潰降級 —— 那兩條也有 OCR 的 token 成本，漏記會讓統計系統性偏低。
+
+用途速查：`usage` 看花多少錢（成本幾乎全在 `prompt_tokens`）、`elapsed_ms` 看客人等多久、
+`grounding_chars` 是前兩者的**原因變數** —— 用來分辨「貴／慢是因為對話歷史長（調
+`agent.py` 的 `GEN_HISTORY_MSGS`）還是檢索撈太多（調 retriever 的 `k`）」。
+`llm_calls` 異常大代表那通在 booking 的 react agent 裡繞圈（對照 `recursion_limit=12`）。
+
+> `cost_usd` 依 langchain 內建價目表估算，表上沒收錄的新模型會算成 0 —— 當趨勢看，別當帳單對。
 
 ### Stateless 設計
 本服務**不保留任何客人狀態**：
@@ -425,6 +438,12 @@ Booking prompt 已改：報體驗價「**一定呼叫 `get_treatment_fee(療程�
 
 > 註：舊的「代名詞解析 (find_relevant_fees Stage 2)」LLM 已隨費用 pre-filter 注入機制移除，改為 booking 認出療程時呼叫 `get_treatment_fee`（純查表、零 LLM）。
 
+> ⚠️ 上表所有 `ChatOpenAI` 實例都必須帶 `timeout` / `max_retries`（`utils/llms.py` 的
+> `LLM_TIMEOUT=60` / `LLM_MAX_RETRIES=1`）。不帶的話 langchain_openai 會把 `None` 一路傳給
+> httpx，實際是 `Timeout(timeout=None)` —— **永遠不會返回**，卡死的呼叫會永久佔住一條
+> threadpool thread（共 40 條），佔滿後 worker 就再也收不了新請求，但進程還活著、
+> `/health` 還是 200，從外面看不出來。新增 LLM 實例時記得一起帶。
+
 ---
 
 ## 13. 重要目錄結構
@@ -609,3 +628,114 @@ BackendResponse(text, images, CallCS, trace) ─► Backend
 
 ### 17.10 其他
 - 移除兩段只印在後端 log 的 debug print（`📤 [Response to Backend]`、`🔍 Agent invoke result`）——不影響 output 契約。
+
+---
+
+## 18. 變更記錄（本批：服務可觀測性與逾時）
+
+### 18.1 LLM 呼叫逾時（最關鍵）
+- `utils/llms.py` 新增 `LLM_TIMEOUT=60` / `LLM_MAX_RETRIES=1`，`LLMModel` 與 `app/backend_agent_service.py`
+  三處直建的 `ChatOpenAI`（OCR、fee filter、價格守門重寫）全部帶上。
+- 修正前實測是 `Timeout(timeout=None)`：連線被 NAT／防火牆靜默切斷時呼叫永不返回，
+  卡住的請求永久佔住 threadpool thread（40 條），佔滿後 worker 形同癱瘓但進程仍活著。
+- 效果不只是「會逾時」——`execute_backend_agent` 的 🛡️ 兜底 try/except 在此之前幾乎不會被觸發
+  （呼叫根本不拋例外）；設了 timeout 才讓既有的兩段式降級（罐頭 → 轉真人）真正啟用。
+- 單一 LLM 呼叫最壞約 120 秒（60×2）。要調整記得乘上一輪的呼叫次數才是客人等待上限。
+
+### 18.2 `recursion_limit` 位置修正 + 調低
+- 舊寫法放在 `config["configurable"]` 裡 → 被當成一般 configurable 值忽略，實際套用預設 25，
+  設的 20 從未生效（已實測確認）。改放頂層。
+- 它管的是**單次 invoke 的 graph super-step 數**，與對話輪數／`message_history` 長度無關。
+  外層是無環 DAG（最長 5 步）碰不到上限；真正受它約束的是 `booking_node` 的
+  `create_react_agent` tool 迴圈 —— 內層子圖透過 contextvar 繼承此值（即使 invoke 未傳 config）。
+- 由 25 調為 12（≈5~6 輪 tool call）：配合 18.1 的 60 秒 timeout，25 步最壞會讓單一 request
+  拖到十幾分鐘並一直佔住 thread。撞上限本就代表這通已歪，早點交給 🛡️ 兜底較好。
+
+### 18.3 LangSmith metadata
+- graph invoke 的 config 補 `run_name="clinic_chat"` 與 metadata：`history_len`、`has_image`、
+  `image_count`、`ocr_text_len`、`ad_referral`、`is_first_turn`、`fee_table_size`。
+- 目的是讓 trace 可分群比較（此前只能逐筆點開）。挑這幾個維度是因為 token 大戶通常不是
+  問題本身，而是累積的對話歷史與塞進 prompt 的檢索量。
+- 尚缺：`call_cs` / `handoff_reason` 是 graph 跑完才算出來的，要當篩選維度得走 LangSmith
+  feedback API（需 `collect_runs` 取 run_id）。目前刻意不做，避免在 request path 上再加一個
+  同步 HTTP 呼叫。
+
+### 18.5 trace 補成本／效能欄位（`usage` / `elapsed_ms` / `grounding_*`）
+- 後端已在存整包 `trace`，等於手上就有一份 eval dataset；缺的是**成本與效能**維度，
+  補齊後「哪類問題最貴／最慢」可直接在後端 MySQL 用 `JSON_EXTRACT` 查，
+  不需要 Prometheus / OpenLIT 之類的額外基礎設施（單台 VM 資源有限，這是刻意的取捨）。
+- `execute_backend_agent` 改為薄包裝，實作移到 `_execute_backend_agent_inner`。
+  包一層的理由：inner 有四個 return 出口，外層量一次才能保證每條路徑都涵蓋到
+  （純圖片短路那條也跑了 OCR、有 token 成本）。
+- token 統計用 `get_openai_callback()`（contextvar 型）。已實測會穿透 LangGraph 節點與
+  巢狀子圖（booking 的 `create_react_agent`），所以 graph 內外所有呼叫都算得到，
+  不必把 handler 一路傳進各函式。
+- `_flatten_strings` 遞迴攤平 grounding —— 它的形狀不固定（`sorted(set)` 的扁平清單
+  或 `[grounded]` 的巢狀清單，見 `agent.py:1382`），不攤平會少算。
+- 📤 log 從 inner 移到外層，第一行加上 `tokens=` / `calls=` / `elapsed_ms=` /
+  `grounding_chars=` 摘要；順帶讓四條 return 路徑都會留下 log（以前只有正常回覆那條會印）。
+
+### 18.4 探活與 log
+- 新增 `GET /health`（`main_webhook.py`）：只回 `{"status":"ok","pid":...}`，不打 OpenAI／MySQL
+  （外部依賴抽風不該讓容器被標成 unhealthy）。`pid` 用來分辨兩個 worker。
+- `HEALTHCHECK` 寫在 **Dockerfile** 而非 compose —— 它是 image 的屬性，不管用 compose、
+  `docker run` 或在 Portainer UI 上直接建容器都適用。`--start-period=120s` 涵蓋索引 warmup。
+- interval 取 **1h**、retries 2（非慣例的 30s×3）：探測每次都在 access log 留一行，
+  30 秒一次一天 2,880 行，會把 `📥`/`📤` 洗掉。刻意拿偵測速度換 log 可讀性，
+  代價是最壞 2 小時才顯示 unhealthy。前提是它只是狀態燈、不是自動復原機制。
+  要做告警或自動重啟時必須調回 30~60s，改用 access log filter 濾 `/health` 解決雜訊。
+- ⚠️ 侷限：`/health` 是 `async def`、跑在 event loop 上，**不經過 threadpool**，
+  所以 18.1 那種 threadpool 耗盡的情況它照樣回 200。真正的防線是 timeout，不是 healthcheck。
+- ⚠️ Docker healthcheck 只把容器標成 unhealthy，`restart: unless-stopped` 不會因此重啟。
+- log rotation（10MB × 5）只寫在 `docker-compose.yml`（見 18.6，`start.ps1` 已不再自帶參數）；
+  每個 request 都會印整包 response 含 trace，不設上限磁碟會被吃滿。改設定需 recreate 才生效。
+- `/chat` 每個請求多印 `⏱️ elapsed=..s`，量測放在 endpoint 層用 `finally`，
+  才涵蓋 `execute_backend_agent` 的多個提早 return（純圖片短路、崩潰降級、崩潰轉真人）與 500。
+
+### 18.6 `start.ps1` 改為呼叫 compose（消除重複設定）
+- 原本自己跑 `docker build` + `docker run`，把 name / port / env_file / restart / log-opt
+  全部重寫一遍 —— 結果**漏掉 compose 裡的三個 chroma volume**：走這條路啟動時容器內沒有現成
+  索引，每次都重呼叫 OpenAI embedding 重建（慢 15~30 秒，且讓「容器能否啟動」綁死在 OpenAI
+  通不通上）。錢不是重點（實測全量重建約 $0.005），**啟動多一個外部依賴才是**。
+- 修法不是補上 `-v`（那只是把要同步維護的項目從 5 個變 8 個），而是讓 `start.ps1` 直接呼叫
+  `docker compose up -d --build`，容器設定只留 `docker-compose.yml` 一份。
+  腳本只保留 compose 沒有的：`.env` 檢查、進度提示、跟 log。
+- ⚠️ `.ps1` 必須存成 **UTF-8 with BOM**。缺 BOM 時 Windows PowerShell 5.1 以 cp950 解讀，
+  中文亂碼且會破壞字串解析 —— 實際症狀是**靜默跳過 build 卻印出成功訊息**，
+  `$LASTEXITCODE` 是舊值所以錯誤分支也不會觸發。
+  用 `Parser::ParseFile` 驗語法測不出來（它以 UTF-8 讀檔），要用 `Get-Content` 才是 PowerShell 的實際解碼路徑。
+
+### 18.7 Grafana 儀表板（`docker-compose.grafana.yml` + `grafana/`）
+- 直接把**後端的 MySQL** 當資料源（trace 存在 `message` 表），不需要 Prometheus / OpenLIT /
+  ClickHouse —— 數值資料已經在關聯式資料庫裡，只缺一個畫圖的前端。整包只多一個約 200MB 的容器。
+- 獨立 stack 並指定 `name: clinic-grafana`。**不指定 project 名稱的話**，兩個 compose 檔會共用
+  目錄名，Grafana 這邊會把 `fb-clinics-agent` 當成孤兒容器並提示加 `--remove-orphans`
+  —— 照做會刪掉正式 AI 服務容器。
+- 資料源與儀表板全走 provisioning（檔案在 `grafana/`），搬機器只要複製檔案；密碼走環境變數。
+- 面板 SQL 必須處理三個**安靜給出錯誤答案**的坑：
+  1. `JSON_EXTRACT` 不 `CAST` → 變字串比較（`MAX` 可能小於 `AVG`），且不報錯。
+  2. 一個請求被寫成兩列（`message_type` 1 與 2 各一列、同一份 trace）→ 成本、請求數都會加倍。
+     所有查詢加 `message_type = 1` 去重（實測 17 列 → 15 個請求）。
+  3. `created_at` 比資料庫自己的 `NOW()` **超前 8 小時** —— 後端把台北時間寫進 UTC 連線的
+     TIMESTAMP 欄位。這是後端的資料 bug，任何用 `NOW()` 或時間範圍的查詢都會中，不只儀表板。
+     儀表板用 `${tzfix}` 常數變數補償（預設 8），後端修好後改成 0 即可。
+     ⚠️ 改 Grafana 的 session timezone **無效** —— TIMESTAMP 欄位與 `FROM_UNIXTIME()` 會一起位移、互相抵銷。
+- ⚠️ port 綁 `127.0.0.1`；正式環境須另建唯讀且只授權 `message` 單表的帳號
+  （現行 `CLINIC_*` 那組看得到整個資料庫，含 `prescription_*` / `payment_detail` / `medical_record_detail`）。
+
+### 18.8 首批線上實測數據（2026-08-12，樣本 15 個請求）
+供日後調參對照，避免再用推測訂數字：
+
+| 指標 | 最小 | 平均 | 最大 |
+|---|---|---|---|
+| `elapsed_ms` | 1,970 | 8,430 | 18,007 |
+| `total_tokens` | 3,638 | 15,394 | 24,574 |
+| `grounding_chars` | 0 | 1,596 | 5,193 |
+| `llm_calls` | 2 | 4.2 | 5 |
+
+- 成本約 **$0.021 / 則**；`prompt_tokens` 佔 **97%**。
+- 成本主要由「**一輪打幾次 LLM × 各自的大 system prompt**」決定，不是對話歷史或檢索量：
+  `llm_calls=2` 約 3,650 tokens，`llm_calls=5` 約 19,000。
+  → 優化方向是**減少呼叫次數**或**開 prompt caching**，不是砍 `GEN_HISTORY_MSGS` 或 retriever 的 `k`。
+- 驗證了 18.1／18.2 兩個原本靠推理訂的參數：單次 LLM 呼叫平均約 2~3.6 秒，離 `LLM_TIMEOUT=60`
+  很遠（不會誤殺）；`llm_calls` 最多 5，沒有逼近 `recursion_limit=12`。兩者都不需調整。

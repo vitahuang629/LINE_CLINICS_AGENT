@@ -1,0 +1,513 @@
+{
+  "uid": "ai-cs-overview",
+  "title": "AI 客服 — 成本 / 效能 / 品質",
+  "description": "資料來源：後端 message 表的 trace 欄位。所有查詢都帶 message_type=1（一個請求會被寫成兩列，不去重會重複計算）與 CAST（JSON_EXTRACT 不轉型會變字串比較，數字會錯）。 ⚠️ created_at 有 +8 小時偏移（後端把本地時間寫進 UTC 的 TIMESTAMP 欄位），全部查詢用 ${tzfix} 變數補償，後端修好後設為 0。",
+  "tags": [
+    "ai",
+    "clinic"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "tzfix",
+        "label": "時區補償(小時)",
+        "type": "constant",
+        "hide": 0,
+        "query": "8",
+        "current": {
+          "text": "8",
+          "value": "8"
+        },
+        "description": "後端把台北時間(+8)寫進 UTC 連線的 TIMESTAMP 欄位，資料在絕對時間上超前 8 小時。所有時間比較都減掉這個值來補償。後端修正資料後改成 0 即可。"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "請求數",
+      "description": "已排除 message_type=2 的重複列",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT COUNT(*) AS `請求數` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "總成本",
+      "description": "依 langchain 內建價目表估算，未收錄的新模型會算成 0 —— 看趨勢，別拿去對帳單",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT ROUND(SUM(CAST(JSON_EXTRACT(trace,'$.usage.cost_usd') AS DECIMAL(12,6))),4) AS `成本` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "平均回應時間",
+      "description": "伺服器端端到端，不含後端推播給客人的時間",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT ROUND(AVG(CAST(JSON_EXTRACT(trace,'$.elapsed_ms') AS UNSIGNED))/1000,2) AS `秒` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "轉真人率",
+      "description": "handoff_reason 非 null 的比例。MariaDB 的 JSON null 經 JSON_UNQUOTE 會變成字串 'null'，所以用 NOT IN ('null') 判斷",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 15
+              },
+              {
+                "color": "red",
+                "value": 30
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT ROUND(100*AVG(JSON_UNQUOTE(JSON_EXTRACT(trace,'$.handoff_reason')) NOT IN ('null')),1) AS `轉真人率` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "請求數與成本",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 40,
+            "lineWidth": 1
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "成本USD"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "custom.drawStyle",
+                "value": "line"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT $__timeGroupAlias(created_at - INTERVAL ${tzfix} HOUR,$__interval), COUNT(*) AS `請求數`, ROUND(SUM(CAST(JSON_EXTRACT(trace,'$.usage.cost_usd') AS DECIMAL(12,6))),4) AS `成本USD` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "回應時間（平均 / 最慢）",
+      "description": "最慢那條用來檢查 LLM_TIMEOUT 設定是否合理 —— 若貼近 60s×呼叫次數就該調整",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT $__timeGroupAlias(created_at - INTERVAL ${tzfix} HOUR,$__interval), ROUND(AVG(CAST(JSON_EXTRACT(trace,'$.elapsed_ms') AS UNSIGNED))) AS `平均`, MAX(CAST(JSON_EXTRACT(trace,'$.elapsed_ms') AS UNSIGNED)) AS `最慢` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "token 組成（input vs output）",
+      "description": "成本幾乎全在 input。實測 input 佔 97%，且主要由『一輪打幾次 LLM × 各自的大 system prompt』決定，不是檢索量",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 70,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT $__timeGroupAlias(created_at - INTERVAL ${tzfix} HOUR,$__interval), SUM(CAST(JSON_EXTRACT(trace,'$.usage.prompt_tokens') AS UNSIGNED)) AS `input`, SUM(CAST(JSON_EXTRACT(trace,'$.usage.completion_tokens') AS UNSIGNED)) AS `output` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "piechart",
+      "title": "路由分布 / 轉真人原因",
+      "description": "route = supervisor 把請求分給誰；handoff_reason 為 null 代表正常完成",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": true
+        }
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT CONCAT(JSON_UNQUOTE(JSON_EXTRACT(trace,'$.route')),' / ',JSON_UNQUOTE(JSON_EXTRACT(trace,'$.handoff_reason'))) AS `分類`, COUNT(*) AS `筆數` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL GROUP BY 1 ORDER BY 2 DESC"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "最貴的 20 筆（含檢索量對照）",
+      "description": "檢索字數高 → 該調 retriever 的 k；LLM次數高 → 該看 booking 的 tool 迴圈。⚠️ 這張表會顯示客人原話",
+      "datasource": {
+        "type": "mysql",
+        "uid": "clinic-mysql"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "耗時"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "成本"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 4
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "datasource": {
+            "type": "mysql",
+            "uid": "clinic-mysql"
+          },
+          "rawSql": "SELECT created_at - INTERVAL ${tzfix} HOUR AS `時間`, LEFT(JSON_UNQUOTE(JSON_EXTRACT(trace,'$.user_input')),40) AS `客人問題`, CAST(JSON_EXTRACT(trace,'$.usage.total_tokens') AS UNSIGNED) AS `tokens`, CAST(JSON_EXTRACT(trace,'$.usage.llm_calls') AS UNSIGNED) AS `LLM次數`, CAST(JSON_EXTRACT(trace,'$.grounding_chars') AS UNSIGNED) AS `檢索字數`, CAST(JSON_EXTRACT(trace,'$.elapsed_ms') AS UNSIGNED) AS `耗時`, CAST(JSON_EXTRACT(trace,'$.usage.cost_usd') AS DECIMAL(12,6)) AS `成本`, JSON_UNQUOTE(JSON_EXTRACT(trace,'$.route')) AS `路由` FROM message WHERE $__timeFilter(created_at - INTERVAL ${tzfix} HOUR) AND message_type = 1 AND JSON_VALID(trace) AND JSON_EXTRACT(trace,'$.usage') IS NOT NULL ORDER BY tokens DESC LIMIT 20"
+        }
+      ]
+    }
+  ]
+}
