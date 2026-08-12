@@ -65,6 +65,39 @@
   - `.env` 由 `env_file` 在 runtime 注入，**不會包進 image** —— 部署到新機器時要手動放一份
   - 容器啟動時先用單一進程 warmup 建好索引，再開 2 個 uvicorn worker
     （避免兩個 worker 同時往同一個 Chroma 目錄寫入）
+  - 另有 `GET /health` 供探活，只回 `{"status":"ok","pid":...}`，不打 OpenAI / MySQL
+    （外部依賴抽風時不該把容器標成 unhealthy）。`pid` 可用來分辨是哪個 worker 回的
+
+  ### 探活與 log
+
+  `HEALTHCHECK` 寫在 **Dockerfile** 而非 compose —— 它是「這個 image 怎麼確認自己活著」的屬性，
+  寫在 image 裡的話，不管用 compose、`docker run` 還是在 Portainer UI 上直接建容器都適用。
+  `--start-period=120s` 是留給啟動時的 warmup（那段期間還沒有 uvicorn 在聽 port，
+  探測必然失敗，但不計入 retries）。
+
+  **interval 用 1 小時**（不是常見的 30s）：探測每次都會在 access log 留一行 `GET /health 200`，
+  30 秒一次等於一天 2,880 行雜訊，在 Portainer 捲 log 找 `📥`/`📤` 時會被洗版。
+  這是拿「偵測速度」換「log 可讀性」—— 代價是服務壞掉後最壞要 2 小時才顯示 `unhealthy`
+  （interval 1h × retries 2）。前提是它只是狀態燈，不是自動復原機制（見下）。
+  哪天要靠它做告警或自動重啟，就得調回 30~60s，改用 access log filter 濾掉 `/health` 解決雜訊。
+
+  > Docker 的 healthcheck 只會把容器標成 `unhealthy`（Portainer / `docker ps` 看得到），
+  > `restart: unless-stopped` 只對「進程結束」生效，**不會**因為 unhealthy 就自動重啟。
+  > 需要自動復原的話得另外掛 autoheal。
+
+  > ⚠️ `/health` 是 `async def`、跑在 event loop 上，**不經過 threadpool**。所以萬一 40 條
+  > threadpool thread 全被卡住的請求佔滿、`/chat` 完全癱瘓，它照樣秒回 200。
+  > 那種情況真正的防線是 LLM 呼叫的 timeout（見 `utils/llms.py`），不是 healthcheck。
+
+  log 上限設 10MB × 5 檔，只寫在 `docker-compose.yml`（`start.ps1` 已改成呼叫 compose，
+  不再自己帶參數 —— 設定只有一份，不會漂移）。本服務每個 request 都會把整包 response 連
+  `trace` 一起印出來，不設上限磁碟遲早被吃滿。改了設定要 **recreate 容器**才生效，
+  restart 不會套用，且舊 log 檔不會被回頭截斷。
+
+  每個 request 會多印一行 `⏱️ /chat fb_account=... elapsed=..s pid=...`，
+  量測點在 `main_webhook.py` 的 endpoint 層（`execute_backend_agent` 有多個提早 return，
+  放外層用 `finally` 才每條路徑都涵蓋得到，連丟 500 也算得進去）。併發時 log 會交錯，
+  用 `fb_account` 跟 `📥` / `📤` 那兩行對起來。
 
   ### volume 掛載
 
@@ -85,6 +118,52 @@
 
   > 此設定假設 host 有持久的檔案系統（VM + docker compose）。若改用 Cloud Run / Fargate
   > 這類無狀態容器平台，bind mount 不會生效，每次冷啟都會重建索引。
+
+  ### `start.ps1`（Windows 便利腳本）
+
+  ```powershell
+  .\start.ps1     # 檢查 .env → docker compose up -d --build → 跟 log
+  ```
+
+  它**只是 compose 的包裝**，中間走的就是 `docker compose up -d --build`。
+  容器設定（port / env / volume / logging / restart）一律只寫在 `docker-compose.yml`。
+
+  > 這支腳本原本是自己跑 `docker build` + `docker run`，把 name / port / env / restart
+  > 又寫了一遍 —— 結果漏掉 compose 裡的三個 chroma volume，走這條路啟動每次都重跑
+  > embedding，還讓「容器能不能啟動」綁死在 OpenAI 通不通上。同一份設定寫兩遍，
+  > 遲早有一遍會漏，所以改成呼叫 compose。**不要再把參數搬回這支腳本裡。**
+
+  > ⚠️ 檔案必須存成 **UTF-8 with BOM**。沒有 BOM 的話 Windows PowerShell 5.1 會用
+  > cp950 解讀，中文變亂碼且會破壞字串解析 —— 症狀是腳本靜默跳過 build 步驟卻印出成功訊息。
+
+  ---
+
+  ## 觀測儀表板（Grafana，選用）
+
+  ```bash
+  docker compose -f docker-compose.grafana.yml up -d
+  # http://localhost:3000  帳號 admin / 密碼見 compose 檔的 GF_SECURITY_ADMIN_PASSWORD
+  ```
+
+  獨立 stack（`name: clinic-grafana`），跟 AI 服務生命週期分開 —— AI 服務常 rebuild，
+  Grafana 設好幾乎不動。資料源直接接**後端的 MySQL**（trace 存在 `message` 表），
+  不需要 Prometheus / ClickHouse 之類的額外資料庫，整包只多一個約 200MB 記憶體的容器。
+
+  資料源與儀表板都走 provisioning（`grafana/` 目錄），搬到別台機器只要複製檔案。
+
+  寫查詢時有三個**會安靜給出錯誤答案**的坑，面板 SQL 都已處理：
+
+  | 坑 | 症狀 | 處理 |
+  |---|---|---|
+  | `JSON_EXTRACT` 不轉型 | 變字串比較，`MAX` 可能小於 `AVG`，且不報錯 | 一律 `CAST(... AS UNSIGNED)` |
+  | 一個請求兩列 | `message_type` 1／2 各一列、同一份 trace → 成本算兩遍 | 加 `message_type = 1` |
+  | `created_at` 超前 8 小時 | 後端把台北時間寫進 UTC 連線的 TIMESTAMP 欄位，「最近 7 天」撈不到資料 | 用 `${tzfix}` 變數補償 |
+
+  > 第三點是**後端的資料 bug**，不只影響儀表板 —— 任何用 `NOW()` 或時間範圍的查詢都會中。
+  > 後端修正後把儀表板的 `tzfix` 變數改成 `0` 即可，不用改 SQL。
+
+  > ⚠️ port 綁在 `127.0.0.1`，不要對公網開 —— 它後面接的是診所正式資料庫。
+  > 正式環境請另建**唯讀且只授權 `message` 一張表**的 MySQL 帳號，別沿用 `CLINIC_*` 那組。
 
   ---
 

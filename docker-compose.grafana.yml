@@ -1,0 +1,74 @@
+# Grafana —— AI 客服的成本／效能／品質儀表板
+#
+# 刻意獨立成一個 stack，不併進 docker-compose.yml：
+#   AI 服務每次改程式碼都要 rebuild 重新部署，Grafana 設好之後幾乎不動。
+#   混在一起的話，每次部署 AI 服務都會順手重啟 Grafana，沒必要。
+#
+# 用法（本機）：
+#   docker compose -f docker-compose.grafana.yml up -d
+#   瀏覽器開 http://localhost:3000   帳號 admin，密碼見下方 GF_SECURITY_ADMIN_PASSWORD
+#
+# 資料來源是「後端的正式 MySQL」，不是本服務自己的資料 ——
+# 本服務 stateless、不寫 DB，trace 是後端收到 response 後存進 message 表的。
+
+# ⚠️ 一定要給獨立的 project 名稱。
+# 不設的話兩個 compose 檔會共用目錄名當 project，Grafana 這邊會把 fb-clinics-agent
+# 當成「孤兒容器」並提示你加 --remove-orphans —— 照做的話正式 AI 服務會被刪掉。
+name: clinic-grafana
+
+services:
+  grafana:
+    image: grafana/grafana-oss:11.3.0     # 有固定版號，避免哪天 latest 換版把儀表板弄壞
+    container_name: clinic-grafana
+    restart: unless-stopped
+
+    ports:
+      # ⚠️ 綁在 127.0.0.1，只有本機連得到。
+      #    絕對不要改成 "3000:3000" 直接對公網開 —— 這個介面後面接的是診所正式資料庫
+      #    （裡面有 prescription / payment / medical_record）。
+      #    要遠端看的話用 SSH tunnel：ssh -L 3000:localhost:3000 <server>
+      - "127.0.0.1:3000:3000"
+
+    environment:
+      # ── 資料庫連線（值由 compose 自動從同目錄的 .env 取代進來）──────────────
+      # 只傳這 5 個變數，不用 env_file: .env —— Grafana 不需要 OPENAI_API_KEY 之類的東西，
+      # 少一個容器持有金鑰就少一個外洩面。
+      #
+      # ⚠️ 這裡先沿用 CLINIC_* 那組是為了本機馬上跑得起來。
+      #    正式環境務必改成唯讀且只授權單一資料表的帳號：
+      #      CREATE USER 'grafana_ro'@'%' IDENTIFIED BY '<強密碼>';
+      #      GRANT SELECT ON hopkins.message TO 'grafana_ro'@'%';
+      #    現在這組 CLINIC_* 看得到整個資料庫，包含病歷與金流。
+      DB_HOST: ${CLINIC_HOST}
+      DB_PORT: ${CLINIC_PORT}
+      DB_NAME: ${CLINIC_DB}
+      DB_USER: ${CLINIC_USER}
+      DB_PASS: ${CLINIC_PASS}
+
+      # ── Grafana 本身 ─────────────────────────────────────────────────────
+      # 預設帳密是 admin/admin，第一次登入會強迫改。這裡直接設掉，避免忘記。
+      # 要換密碼就在 .env 加一行 GRAFANA_ADMIN_PASSWORD=...
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-clinic-local-only}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+
+    volumes:
+      # Grafana 自己的小資料庫（儀表板編輯紀錄、使用者、告警規則）。
+      # 沒掛的話容器一重建，你在 UI 上調過的東西全部消失。
+      # 注意：provisioning 進來的儀表板不受影響（那是檔案），這個是存 UI 上的異動。
+      - grafana-data:/var/lib/grafana
+      # provisioning：容器啟動時自動建立資料源與儀表板，不用手動點。
+      # 這樣「本機做好 → 搬上 server」只是複製檔案，不用重做一遍。
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  grafana-data:

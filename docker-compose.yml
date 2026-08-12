@@ -12,6 +12,15 @@ services:
       - "8004:8004"
     env_file:
       - .env                     # runtime 才注入 .env（不會包進 image）
+    # log 上限：docker json-file 預設沒有上限，而本服務每個 request 都會把整包 response
+    # （含 trace，indent=2）印出來（app/backend_agent_service.py 的 📤 那段），量很大。
+    # 不設的話磁碟遲早被吃滿。10MB × 5 檔 = 最多 50MB，夠翻查最近的對話。
+    # 注意：改這裡要 recreate 容器才生效（restart 不會套用），且舊 log 檔不會被回頭截斷。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     volumes:
       # 向量索引存到容器外，重啟不必重跑 OpenAI embedding。
       # 每個 collection 一個目錄，三個都要掛（漏掉的那個每次啟動還是會重建）。

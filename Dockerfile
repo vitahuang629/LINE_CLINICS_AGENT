@@ -63,6 +63,30 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8004
 
+# 存活探測：打 GET /health（見 main_webhook.py）。
+# 放在 Dockerfile 而不是 docker-compose.yml，是因為 start.ps1 走的是 docker run，
+# 寫在 compose 裡那條路徑就吃不到；寫在這裡兩種啟動方式都有。
+#
+# start-period 給 120s：容器啟動時要先跑單進程 warmup 建索引（首次部署約 30 秒，
+# 之後約 15 秒），這段期間根本還沒有 uvicorn 在聽 port，探測必然失敗。
+# start-period 內的失敗不計入 retries，所以不會在 warmup 途中被誤判。
+#
+# interval 用 1h（不是常見的 30s）：探測每次都會在 uvicorn access log 留一行
+# `GET /health 200`，30 秒一次等於一天 2,880 行雜訊，在 Portainer 捲 log 找 📥/📤
+# 時會被洗版。這裡刻意用「log 可讀性」換「偵測速度」。
+# retries 配合降為 2 —— 間隔拉長後，「連續兩次、相隔一小時都失敗」已是很強的訊號。
+#
+# ⚠️ 代價：服務壞掉後最壞要 2 小時才會顯示 unhealthy。這個取捨的前提是
+#    healthcheck 在這裡只是「給人看的狀態燈」，不是自動復原機制（見下）。
+#    若哪天要靠它做自動重啟或告警，interval 必須調回 30~60s，
+#    改用 access log filter 濾掉 /health 來解決雜訊問題。
+#
+# 注意：Docker 的 healthcheck 只會把容器標成 unhealthy（Portainer / docker ps 看得到），
+# restart: unless-stopped 只對「進程結束」生效，不會因為 unhealthy 就自動重啟。
+# 要自動重啟得另外掛 autoheal 之類的東西。
+HEALTHCHECK --interval=1h --timeout=5s --start-period=120s --retries=2 \
+    CMD curl -fsS http://localhost:8004/health || exit 1
+
 # 先用單一進程 warmup 建好索引（避免兩個 worker 同時重建 chroma 造成寫入衝突），
 # 再啟動多 worker 的 uvicorn —— 此時 worker 只會載入已建好的索引。
 CMD ["sh", "-c", "python -c 'import toolkit.toolkits' && uvicorn main_webhook:app --host 0.0.0.0 --port 8004 --workers 2"]

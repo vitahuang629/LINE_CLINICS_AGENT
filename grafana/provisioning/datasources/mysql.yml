@@ -1,0 +1,23 @@
+# 資料源：後端的 MySQL（MariaDB 10.6）—— trace 存在 message 表的 trace 欄位
+#
+# ${DB_*} 由 docker-compose.grafana.yml 的 environment 注入。
+# Grafana 的 provisioning 檔支援環境變數取代，所以密碼不會寫死在版控裡。
+
+apiVersion: 1
+
+datasources:
+  - name: clinic-mysql
+    uid: clinic-mysql          # 儀表板 JSON 靠這個 uid 指向本資料源，別改
+    type: mysql
+    access: proxy              # 由 Grafana 後端連 DB（不是瀏覽器直連）
+    url: ${DB_HOST}:${DB_PORT}
+    database: ${DB_NAME}
+    user: ${DB_USER}
+    secureJsonData:
+      password: ${DB_PASS}
+    jsonData:
+      # 連線數壓低 —— 這是診所的正式庫，儀表板不該跟線上服務搶連線。
+      maxOpenConns: 4
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    editable: false            # 防止有人在 UI 上改掉連線設定卻沒同步回這個檔

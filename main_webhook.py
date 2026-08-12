@@ -1,3 +1,6 @@
+import os
+from time import perf_counter
+
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 # from app.line_service import line_webhook
@@ -9,6 +12,22 @@ app = FastAPI(root_path="/fb-clinics-agent")
 # @app.post("/line_webhook")
 # async def webhook(request: Request):
 #     return await line_webhook(request)
+
+
+@app.get("/health")
+async def health():
+    """
+    存活探測（Dockerfile HEALTHCHECK / 反向代理 / 外部 uptime 監控用）。
+
+    刻意「只回 200」，不去 ping OpenAI 或 MySQL：
+      - 索引是在 import 期間建好的（`app.backend_agent_service` → `toolkit.toolkits`），
+        uvicorn worker 能開始收請求就代表索引已載入，這個 200 本身就有意義。
+      - 若在這裡打外部依賴，OpenAI 或 DB 一抽風就會把容器標成 unhealthy，
+        但那種時候服務其實還能處理其他請求，得不償失。
+
+    pid 用來分辨是哪個 uvicorn worker 回的（正式環境跑 --workers 2）。
+    """
+    return {"status": "ok", "pid": os.getpid()}
 
 @app.post("/chat", response_model=BackendResponse)
 async def backend_chat(query: BackendUserQuery):
@@ -95,7 +114,19 @@ async def backend_chat(query: BackendUserQuery):
     """
     # 把 sync 的 execute_backend_agent 丟到 threadpool 跑，避免阻塞 event loop
     # 這樣多個 request 進來時可以並行處理（threadpool 預設 40 個 worker）
-    return await run_in_threadpool(execute_backend_agent, query)
+    #
+    # 耗時量測放在這一層（而不是 execute_backend_agent 內部）：
+    # 那支函式有多個提早 return（純圖片短路、graph 崩潰降級、崩潰後轉真人），
+    # 在這裡用 finally 才能保證每條路徑都印得到，連丟 500 的情況也算得到。
+    t0 = perf_counter()
+    try:
+        return await run_in_threadpool(execute_backend_agent, query)
+    finally:
+        # 併發時 log 會交錯，所以帶 fb_account 方便和 📥/📤 那兩行對起來
+        print(
+            f"⏱️ /chat fb_account={query.fb_account} "
+            f"elapsed={perf_counter() - t0:.2f}s pid={os.getpid()}"
+        )
 
 if __name__ == "__main__":
     import uvicorn

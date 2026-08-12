@@ -119,6 +119,27 @@ booking 代理在對話中**認出療程的當下**才呼叫 `get_treatment_fee(
 | backend | `user_input` | 含圖片 OCR 文字在內的完整輸入（後端手上只有原始 content）|
 | backend | `price_guard` | **只有價格守門啟動時**才有：`{leaked, allowed, reply_treatments, retried, resolved, handoff}` |
 | backend | `handoff_reason` | `customer_keyword` / `fact_check` / `price_fabrication` / `booking` / `null` |
+| backend | `usage` | `{total_tokens, prompt_tokens, completion_tokens, llm_calls, cost_usd}` — 本輪**所有** OpenAI 呼叫的加總（graph 各節點 + OCR + fee filter + 價格守門重寫）|
+| backend | `elapsed_ms` | 伺服器端端到端耗時（毫秒）|
+| backend | `grounding_chunks` / `grounding_chars` | 本輪塞進 prompt 的檢索原文「段數」與「總字數」|
+
+> **⚠️ 契約變更（2026-08-12）**：`trace` **不再會是 `null`**。
+> 以前「純圖片、OCR 抓不到文字」的短路路徑回傳 `trace: null`，現在最少也會有上面
+> 最後三組（`usage` / `elapsed_ms` / `grounding_*`）—— 那條路徑也跑了 OCR、有實際 token
+> 成本，漏記會讓成本統計系統性偏低。若後端有 `if trace is None` 之類的判斷，
+> 請改成檢查業務欄位（例如 `route`）是否存在。
+> `text` / `images` / `CallCS` 的格式與行為完全未變。
+
+> 後三組是**成本與效能**維度，其餘是品質維度。用途：`usage` 看花多少錢（成本幾乎全在
+> `prompt_tokens`）、`elapsed_ms` 看客人等多久、`grounding_chars` 是前兩者的**原因變數**
+> —— 用來分辨貴／慢是因為對話歷史長還是檢索撈太多（兩者要調的旋鈕不同）。
+> `llm_calls` 異常大代表那通在 booking 的 react agent 裡繞圈。
+> `cost_usd` 依 langchain 內建價目表估算，未收錄的新模型會算成 0 —— 看趨勢，別拿去對帳單。
+
+> **入庫建議**：目前一個請求會被寫成兩列（`message_type` 1 與 2 各一列、帶同一份 trace），
+> 做成本或請求數統計時務必去重，否則會加倍。另外 `created_at` 目前存的是台北時間，
+> 但 DB 連線時區是 UTC，導致資料在絕對時間上超前 8 小時 —— 任何用 `NOW()` 或時間範圍的
+> 查詢都會撈不到最近的資料，建議一併修正。
 
 ---
 
