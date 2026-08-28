@@ -1,6 +1,10 @@
 venv/
 *.env
-data/
+data/*
+!data/*.csv
+# 預約紀錄含 patient_to_attend 病患編號，只放內部 GitLab 的 data/private-availability 分支，不進公開 repo
+data/availability.csv
+data/treatment_availability.csv
 notebook/
 **/__pycache__/
 *.pyc
